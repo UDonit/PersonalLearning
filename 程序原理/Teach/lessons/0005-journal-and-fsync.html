@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第五课：ext4 Journal（JBD2）与 fsync — 崩溃恢复与数据耐久性</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+<style>
+  .flow-box {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 1em 0;
+    font-size: 0.9rem;
+    box-shadow: 0 1px 3px var(--shadow);
+  }
+  .flow-box .title {
+    font-weight: 500;
+    color: var(--accent);
+    margin-bottom: 0.4rem;
+  }
+  .journal-block {
+    display: flex; flex-wrap: wrap; gap: 0.5rem;
+    margin: 1em 0;
+  }
+  .journal-block .tag {
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0.3rem 0.6rem; border-radius: 4px;
+    font-family: var(--mono); font-size: 0.78rem;
+  }
+  .tag-desc { background: #e3f2e0; border: 1px solid #337733; color: #1b4d1b; }
+  .tag-commit { background: #fff9c4; border: 1px solid #d4a017; }
+  .tag-revoke { background: #fce8e6; border: 1px solid #c62828; color: #8b1e1e; }
+  .tag-meta { background: #e1eaf3; border: 1px solid #2e6b9e; }
+
+  .mode-table th { font-size: 0.85rem; }
+  .mode-table td { font-size: 0.82rem; vertical-align: top; }
+
+  .step-card {
+    counter-increment: step;
+    margin: 1em 0;
+    padding: 0.8rem 1rem 0.8rem 3.2rem;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    position: relative;
+  }
+  .step-card::before {
+    content: counter(step);
+    position: absolute;
+    left: 0.6rem; top: 0.8rem;
+    width: 1.8rem; height: 1.8rem;
+    background: var(--accent);
+    color: white;
+    font-weight: 500;
+    font-size: 0.85rem;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .timeline { counter-reset: step; }
+
+  .compare-row {
+    display: flex; gap: 1rem; margin: 1em 0;
+  }
+  .compare-col {
+    flex: 1;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.8rem;
+    background: white;
+  }
+  .compare-col h4 {
+    margin-top: 0;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.4rem;
+  }
+  @media (max-width: 640px) {
+    .compare-row { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+
+<h1>📝 第五课：ext4 Journal（JBD2）与 fsync</h1>
+
+<div class="lesson-meta">
+  <strong>主题</strong>：ext4 的日志系统（JBD2）——事务模型、三种日志模式、崩溃恢复、fsync/fdatasync 的实现<br>
+  <strong>前置知识</strong>：第四课（ext4 磁盘数据结构）、第三课（page cache 与回写）<br>
+  <strong>预估时间</strong>：35–45 分钟
+</div>
+
+<h2>从 delalloc 的"阿喀琉斯之踵"说起</h2>
+
+<p>第四课我们学习了 delalloc——把磁盘块分配推迟到回写时，将多次小写入合并为一次大的连续分配。但这也带来了一个风险：</p>
+
+<div class="flow-box">
+  <div class="title">⚠️ delalloc 的代价</div>
+  <p><code>write()</code> 返回成功时数据只在 page cache 中。如果回写前系统崩溃——<strong>数据彻底丢失</strong>。但这只是问题的一角。</p>
+</div>
+
+<p>即使没有 delalloc，传统的文件系统写入也存在一个根本问题：<strong>多步操作不是原子的</strong>。</p>
+
+<pre>
+写入一个文件需要更新至少三处磁盘数据：
+  ① 数据块内容本身
+  ② inode 中的元数据（大小、时间戳、extent 树/块指针）
+  ③ 块位图（标记这些块已被占用）
+
+如果写完①，还没来得及写②③就崩溃了：
+  → 重启后：数据块里有内容，但 inode 不知道它。
+  → 这些块在 bitmap 中仍标记为"空闲"，可能被其他文件覆盖。
+  → 结果：文件内容损坏或交叉链接。
+</pre>
+
+<div class="insight">
+  <strong>💡 核心问题</strong>：磁盘的写入是"扇区级原子"的——一个扇区（512 字节）的写入要么完成要么没完成。但文件系统的更新涉及<strong>多个扇区、多个块</strong>，不是原子的。系统在中间任何一个时刻崩溃，磁盘状态都会不一致。
+</div>
+
+<h2>1. JBD2：ext4 的日志层</h2>
+
+<p>ext4 引入了 <strong>JBD2（Journaling Block Device layer 2）</strong>——这是一个独立的日志层，不仅 ext4 用，也在 ocfs2 等其他文件系统中使用。它的核心思想是：<strong>在修改磁盘数据之前，先把"你要做什么"记到日志里</strong>。</p>
+
+<h3>1.1 日志的物理位置</h3>
+
+<p>ext4 格式化时会在磁盘上预留一段空间作为<strong>日志（journal）</strong>。默认情况下，日志内嵌在文件系统内部（<code>journal_internal</code>），也可以放在外部块设备上（用于高性能场景）：</p>
+
+<div class="figure">
+<svg viewBox="0 0 640 80" width="640" height="80" style="max-width:100%;height:auto;">
+  <rect x="20" y="10" width="50" height="40" rx="4" fill="#999" stroke="#666" stroke-width="1"/>
+  <text x="45" y="34" text-anchor="middle" font-size="8" fill="white">引导</text>
+
+  <rect x="70" y="10" width="80" height="40" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="110" y="34" text-anchor="middle" font-size="8">块组 0</text>
+
+  <rect x="150" y="10" width="30" height="40" rx="4" fill="#fff9c4" stroke="#d4a017" stroke-width="1.2"/>
+  <text x="165" y="34" text-anchor="middle" font-size="8">...</text>
+
+  <rect x="180" y="10" width="100" height="40" rx="4" fill="#fce8e6" stroke="#c62828" stroke-width="1.2"/>
+  <text x="230" y="28" text-anchor="middle" font-size="8" fill="#c62828" font-weight="500">Journal</text>
+  <text x="230" y="40" text-anchor="middle" font-size="7" fill="#c62828">(日志区域)</text>
+
+  <rect x="280" y="10" width="30" height="40" rx="4" fill="#fff9c4" stroke="#d4a017" stroke-width="1.2"/>
+  <text x="295" y="34" text-anchor="middle" font-size="8">...</text>
+
+  <rect x="310" y="10" width="80" height="40" rx="4" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="350" y="34" text-anchor="middle" font-size="8">块组 N-1</text>
+
+  <text x="320" y="72" text-anchor="middle" font-size="9" fill="#666">ext4 分区 = 块组 + Journal（默认 128MB~1GB，取决于分区大小）</text>
+</svg>
+<figcaption>Journal 是 ext4 分区中的一段预留空间，独立于块组管理</figcaption>
+</div>
+
+<p>查看你的日志参数：</p>
+<pre>
+tune2fs -l /dev/sda1 | grep -E "Journal|Journal size"
+# Journal inode:            8
+# Journal size:             128M
+# Journal backup:           inode blocks
+</pre>
+
+<h3>1.2 日志的环形缓冲区结构</h3>
+
+<p>Journal 在磁盘上被组织为一个<strong>环形缓冲区（circular buffer）</strong>，由 journal 超级块和多个 journal 块组成：</p>
+
+<div class="figure">
+<svg viewBox="0 0 640 100" width="640" height="100" style="max-width:100%;height:auto;">
+  <!-- 环形 buffer 示意 -->
+  <rect x="20" y="10" width="600" height="40" rx="6" fill="#f5f5f5" stroke="#6b6760" stroke-width="1"/>
+
+  <rect x="25" y="13" width="50" height="34" rx="3" fill="#fff9c4" stroke="#d4a017" stroke-width="1"/>
+  <text x="50" y="34" text-anchor="middle" font-size="7">JSB</text>
+  <text x="50" y="42" text-anchor="middle" font-size="6" fill="#999">超级块</text>
+
+  <rect x="78" y="13" width="50" height="34" rx="3" fill="#e3f2e0" stroke="#337733" stroke-width="1"/>
+  <text x="103" y="34" text-anchor="middle" font-size="7">描述块</text>
+
+  <rect x="131" y="13" width="50" height="34" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="156" y="34" text-anchor="middle" font-size="7">数据 1</text>
+
+  <rect x="184" y="13" width="50" height="34" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="209" y="34" text-anchor="middle" font-size="7">数据 2</text>
+
+  <rect x="237" y="13" width="50" height="34" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="262" y="34" text-anchor="middle" font-size="7">数据 3</text>
+
+  <rect x="290" y="13" width="50" height="34" rx="3" fill="#fce8e6" stroke="#c62828" stroke-width="1"/>
+  <text x="315" y="34" text-anchor="middle" font-size="7">提交块</text>
+
+  <rect x="343" y="13" width="50" height="34" rx="3" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2" stroke-dasharray="3,2"/>
+  <text x="368" y="34" text-anchor="middle" font-size="7">(空闲)</text>
+
+  <rect x="396" y="13" width="50" height="34" rx="3" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2" stroke-dasharray="3,2"/>
+  <text x="421" y="34" text-anchor="middle" font-size="7">(空闲)</text>
+
+  <rect x="449" y="13" width="50" height="34" rx="3" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2" stroke-dasharray="3,2"/>
+  <text x="474" y="34" text-anchor="middle" font-size="7">(空闲)</text>
+
+  <rect x="502" y="13" width="50" height="34" rx="3" fill="#fce8e6" stroke="#c62828" stroke-width="1"/>
+  <text x="527" y="28" text-anchor="middle" font-size="7">撤销块</text>
+  <text x="527" y="40" text-anchor="middle" font-size="6" fill="#c62828">(revoke)</text>
+
+  <rect x="555" y="13" width="60" height="34" rx="3" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2" stroke-dasharray="3,2"/>
+  <text x="585" y="34" text-anchor="middle" font-size="7">(空闲)</text>
+
+  <!-- 箭头 -->
+  <path d="M 20 70 L 20 80 L 620 80" fill="none" stroke="#666" stroke-width="0.8"/>
+  <polygon points="620,80 615,77 615,83" fill="#666"/>
+
+  <rect x="480" y="72" width="120" height="18" rx="3" fill="#fce8e6" stroke="#c62828" stroke-width="0.8"/>
+  <text x="540" y="84" text-anchor="middle" font-size="8" fill="#c62828">← 日志尾（旧事务）</text>
+
+  <text x="680" y="34" text-anchor="middle" font-size="8" fill="#999">↑ 日志头（新事务写入位置）</text>
+</svg>
+<figcaption>Journal 是环形缓冲区。新事务写到日志头，旧事务从日志尾被 checkpoint（回收）。</figcaption>
+</div>
+
+<h2>2. JBD2 的事务模型</h2>
+
+<p>JBD2 的核心概念是<strong>事务（transaction）</strong>。一个事务包含一组"要么全部生效、要么全部不生效"的磁盘更新。</p>
+
+<h3>2.1 三要素：句柄（handle）→ 事务（transaction）→ 提交（commit）</h3>
+
+<div class="timeline">
+
+<div class="step-card">
+  <strong>开始事务</strong>
+  <p>内核线程调用 <code>journal_start()</code> 获取一个 <strong>handle</strong>（句柄）。句柄是文件系统代码与 JBD2 之间的接口——每个需要修改元数据的操作都要先拿一个 handle。</p>
+  <pre>// 简化示例：ext4 写入一个数据块时的日志操作
+handle_t *handle = ext4_journal_start(inode, 1);  // 申请一个句柄
+if (IS_ERR(handle))
+    return PTR_ERR(handle);
+
+// 在日志中预留空间
+ext4_journal_get_write_access(handle, bh);  // 通知 JBD2 要修改这个 buffer head
+
+ext4_mark_inode_dirty(handle, inode);       // 修改 inode
+ext4_journal_dirty_meta(handle, bh);        // 标记 buffer 为脏
+</pre>
+</div>
+
+<div class="step-card">
+  <strong>提交事务（commit）</strong>
+  <p><code>journal_stop(handle)</code> 释放句柄。当所有活跃句柄都停止后，JBD2 将该事务提交到磁盘日志区：</p>
+  <pre>journal_stop(handle);
+// 内核在适当时机自动触发提交，或 fsync() 主动触发
+</pre>
+</div>
+
+<div class="step-card">
+  <strong>Checkpoint（回收日志空间）</strong>
+  <p>事务提交后，日志中已经记录了本次修改。但日志空间是有限的，需要把日志中的数据真正写到目标位置（inode 表、数据块等），然后才能释放日志空间。</p>
+  <pre>// Checkpoint 完成 = 日志中的修改已同步到目标位置
+// 此时这些日志块可以回收，给新事务使用
+</pre>
+</div>
+
+</div>
+
+<h3>2.2 一次完整的日志提交过程</h3>
+
+<div class="flow-box">
+  <div class="title">🚀 事务提交的五个步骤</div>
+  <ol style="margin:0.5em 0 0 1.5rem;">
+    <li><strong>锁定事务</strong>：禁止新的句柄加入，等待所有正在进行的句柄完成</li>
+    <li><strong>写描述块</strong>：写一个 <code>descriptor block</code>，记录本事务中所有要修改的块号及其校验和</li>
+    <li><strong>写数据块</strong>：将所有被修改的块（元数据块）写入日志区域。可以合并多个块到一次 I/O</li>
+    <li><strong>写提交块</strong>：写一个 <code>commit block</code>，包含事务ID（TID）、校验和等。这一步代表事务"已提交"的<strong>原子设施</strong></li>
+    <li><strong>唤醒等待者</strong>：通知等待该事务完成的进程（如 fsync 的调用者）</li>
+  </ol>
+</div>
+
+<p>一个<strong>关键设计</strong>：第 2~3 步写日志块，第 4 步写提交块。如果在写提交块之前崩溃——重启后检查日志时发现没有提交块，会<strong>丢弃这个不完整的事务</strong>（认为它从未发生过）。</p>
+
+<h3>2.3 一次日志提交在磁盘上的布局</h3>
+
+<div class="figure">
+<svg viewBox="0 0 640 60" width="640" height="60" style="max-width:100%;height:auto;">
+  <rect x="20" y="10" width="100" height="30" rx="4" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="70" y="30" text-anchor="middle" font-size="9">描述块</text>
+  <text x="70" y="40" text-anchor="middle" font-size="7" fill="#337733">(块号列表)</text>
+
+  <rect x="130" y="10" width="80" height="30" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="170" y="30" text-anchor="middle" font-size="9">元数据块 1</text>
+
+  <rect x="220" y="10" width="80" height="30" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="260" y="30" text-anchor="middle" font-size="9">元数据块 2</text>
+
+  <rect x="310" y="10" width="80" height="30" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="350" y="30" text-anchor="middle" font-size="9">元数据块 3</text>
+
+  <rect x="400" y="10" width="100" height="30" rx="4" fill="#fce8e6" stroke="#c62828" stroke-width="1.2"/>
+  <text x="450" y="30" text-anchor="middle" font-size="9" fill="#c62828">提交块</text>
+  <text x="450" y="40" text-anchor="middle" font-size="7" fill="#c62828">(TID + 校验和)</text>
+</svg>
+<figcaption>一次日志提交的磁盘布局。描述块记录"哪些块被修改"，元数据块是实际内容，提交块是"我完成了"的标记。</figcaption>
+</div>
+
+<h3>2.4 崩溃恢复——回放日志</h3>
+
+<p>系统崩溃重启后，在挂载文件系统时，e2fsck 或 JBD2 的恢复机制会检查日志：</p>
+
+<div class="flow-box">
+  <div class="title">🔁 恢复过程</div>
+  <ol style="margin:0.5em 0 0 1.5rem;">
+    <li>扫描 journal 区域，找到<strong>完整的已提交事务</strong>（有描述块 + 数据 + 提交块的）</li>
+    <li>对于每个完整事务：把日志中的数据<strong>回放（replay）</strong>到目标位置（inode 表、块位图等）</li>
+    <li>对于<strong>不完整的事务</strong>（有描述块但没有对应的提交块）：<strong>直接丢弃</strong>——认为从未发生过</li>
+    <li>回放完成后，文件系统状态与崩溃前一致——所有已提交的修改都已恢复</li>
+  </ol>
+</div>
+
+<div class="insight">
+  <strong>💡 关键原则</strong>：日志不保证"崩溃时不丢数据"，它保证的是<strong>文件系统的一致性</strong>。要么修改全部完成（事务已提交），要么全部没发生（事务未提交或丢弃）。这是 ACID 中的 A（原子性）和 C（一致性）。</div>
+
+<h2>3. ext4 三种日志模式</h2>
+
+<p>ext4 提供了三种日志模式，通过 <code>mount -o data=...</code> 选项设置：</p>
+
+<table class="mode-table">
+  <tr><th>模式</th><th>mount 选项</th><th>谁被日志化</th><th>性能</th><th>安全性</th></tr>
+  <tr>
+    <td><strong>ordered</strong>（默认）</td>
+    <td><code>data=ordered</code></td>
+    <td>✅ 元数据记录日志<br>✅ 数据先于元数据写盘</td>
+    <td>⭐⭐⭐⭐</td>
+    <td>⭐⭐⭐⭐</td>
+  </tr>
+  <tr>
+    <td><strong>writeback</strong></td>
+    <td><code>data=writeback</code></td>
+    <td>✅ 元数据记录日志<br>❌ 数据不记录日志<br>❌ 数据和元数据顺序无保证</td>
+    <td>⭐⭐⭐⭐⭐</td>
+    <td>⭐⭐</td>
+  </tr>
+  <tr>
+    <td><strong>journal</strong></td>
+    <td><code>data=journal</code></td>
+    <td>✅ 元数据记录日志<br>✅ 数据也记录日志（写两次：先日志，再目标位置）</td>
+    <td>⭐⭐</td>
+    <td>⭐⭐⭐⭐⭐</td>
+  </tr>
+</table>
+
+<h3>3.1 data=ordered 默认模式</h3>
+
+<p>这是 ext4 的默认模式，也是绝大多数 Linux 发行版的默认选项。它的规则是：</p>
+
+<pre>
+① 数据块（文件内容）写入目标位置 ✅（直接写，不进日志）
+② 元数据（inode、bitmap 等）写入日志 ✅
+③ 顺序保证：① 必须在 ② 之前完成
+</pre>
+
+<p>为什么数据先写？考虑这个场景：</p>
+
+<pre>
+追加写 4KB 到文件末尾：
+  数据块（新内容）→ 直接写到数据区 ✓（先做）
+  inode 更新（新的 i_size、extent 指针）→ 写到日志 ✓（后做）
+
+如果在这两步之间崩溃又恢复：
+  ➡️ 数据块已经写好了
+  ➡️ 日志中的 inode 更新被回放到目标位置
+  ➡️ 文件系统一致 ✅
+
+反过来如果元数据先写、数据后写：
+  ➡️ inode 已经记录了"文件有 4KB 新数据"
+  ➡️ 但数据块还没写就崩溃了
+  ➡️ 重启后 inode 指向了"全零"的数据块 ➡️ 文件内容全零 ❌
+  （这就是 known as "torn write" 的一种表现）
+</pre>
+
+<h3>3.2 data=writeback 模式</h3>
+
+<p>只对元数据做日志，数据直接写目标位置，<strong>不保证顺序</strong>：</p>
+
+<pre>
+writeback 模式：
+  数据块 → 随时写（可能在元数据之前、之后、或同时）
+  元数据 → 写日志
+
+如果崩溃：
+  元数据通过日志恢复 → 文件系统结构一致 ✅
+  但文件内容可能包含"垃圾"（inode 指向了尚未写入的数据块）❌
+</pre>
+
+<p><strong>适用场景</strong>：性能敏感、可以容忍少量文件内容损坏的系统（如某些大数据集群的临时数据）。性能比 ordered 模式高出约 5–10%。</p>
+
+<h3>3.3 data=journal 模式</h3>
+
+<p>最安全的模式——<strong>所有数据先写日志，再写目标位置</strong>：</p>
+
+<pre>
+data=journal 模式下的写入流程：
+
+  write() → page cache → 标记脏
+                  ↓
+  flusher/fsync → ① 数据 + 元数据 → 写入日志
+                  ② 日志提交（写提交块）
+                  ③ 数据从日志回放到目标位置（checkpoint）
+                  ④ 日志空间回收
+</pre>
+
+<p>这意味着<strong>每个数据块被写两次</strong>：一次进日志，一次进目标位置。性能大幅下降，但提供了最高级别的保护——即使崩溃发生在数据写到目标位置的瞬间，重启恢复时也能从日志中重放。而且 <code>data=journal</code> 还有一个额外的好处：<strong>不需要 fsync 就能保证数据安全</strong>——只要日志提交了，崩溃恢复时数据会自动回放。</p>
+
+<h3>3.4 三种模式的对比</h3>
+
+<div class="compare-row">
+  <div class="compare-col">
+    <h4 style="color:#2e6b9e;">ordered ✅</h4>
+    <ul style="font-size:0.85rem;">
+      <li>数据直接写目标位置</li>
+      <li>元数据写日志</li>
+      <li>写顺序保证：数据先于元数据</li>
+      <li>崩溃时：文件内容不会出现"零"</li>
+      <li><strong>默认模式，适合绝大多数场景</strong></li>
+    </ul>
+  </div>
+  <div class="compare-col">
+    <h4 style="color:#e65100;">writeback ⚡</h4>
+    <ul style="font-size:0.85rem;">
+      <li>数据直接写目标位置</li>
+      <li>元数据写日志</li>
+      <li>写顺序<strong>不保证</strong></li>
+      <li>崩溃时：文件可能含垃圾数据</li>
+      <li><strong>性能最高，安全性最低</strong></li>
+    </ul>
+  </div>
+  <div class="compare-col">
+    <h4 style="color:#337733;">journal 🛡️</h4>
+    <ul style="font-size:0.85rem;">
+      <li>数据先写日志，再写目标位置</li>
+      <li>元数据写日志</li>
+      <li>数据写了两次</li>
+      <li>崩溃时：可完全恢复</li>
+      <li><strong>性能最低，安全性最高</strong></li>
+    </ul>
+  </div>
+</div>
+
+<h2>4. fsync 与 fdatasync</h2>
+
+<p>现在我们来回答一个实际问题：<strong>"调用 fsync 后，数据到底什么时候真正在磁盘上？"</strong></p>
+
+<h3>4.1 fsync() 干了什么</h3>
+
+<pre>
+// 用户态
+#include &lt;unistd.h&gt;
+
+write(fd, buf, 4096);   // 数据在 page cache 中
+fsync(fd);              // 等待所有数据刷新到磁盘
+
+// 返回后 → 数据的耐久性有保证
+</pre>
+
+<p>在 ext4 中，<code>fsync()</code> 的内核路径大致是：</p>
+
+<pre>
+sys_fsync(fd)
+  → vfs_fsync(file, 0)
+    → ext4_sync_file(file, 0)
+      → filemap_write_and_wait_range(inode)      // ① 刷脏页到磁盘
+      → jbd2_complete_transaction(inode->i_journal) // ② 等待当前事务提交
+      → blkdev_issue_flush(bdev)                    // ③ 发 FLUSH CACHE 命令
+</pre>
+
+<p>三个关键步骤：</p>
+
+<div class="timeline">
+
+<div class="step-card">
+  <strong>① 刷脏页</strong>
+  <p><code>filemap_write_and_wait_range()</code> 回写该文件在 page cache 中的所有脏页。在 ordered 模式下，这就是把数据块直接写到目标位置（数据区）。</p>
+</div>
+
+<div class="step-card">
+  <strong>② 等待日志提交完成</strong>
+  <p><code>jbd2_complete_transaction()</code> 确保包含该文件 inode/bitmap 更新的日志事务已经提交到磁盘日志区。在 ordered 模式下，这一步发生在<strong>脏页刷完以后</strong>。</p>
+</div>
+
+<div class="step-card">
+  <strong>③ 发出 FLUSH CACHE 命令</strong>
+  <p><code>blkdev_issue_flush()</code> 向磁盘发送 <strong>FLUSH CACHE</strong> 命令。现代磁盘都有<strong>写缓存（write cache）</strong>——磁盘告诉"写入完成"时数据可能还在磁盘的 DRAM 缓存里，没到盘片上。FLUSH CACHE 强制把缓存中的数据刷到持久介质。</p>
+</div>
+
+</div>
+
+<div class="insight">
+  <strong>💡 关键细节</strong>：步骤 ③ 是很多工程师忽略的。即使数据写到了磁盘，也可能卡在磁盘的写缓存中。如果此时断电，<strong>磁盘写缓存中的数据仍然会丢失</strong>。这也是为什么数据库服务器通常建议关闭磁盘写缓存：<code>hdparm -W 0 /dev/sda</code>。或者通过 mount 选项 <code>barrier=1</code> 让 ext4 在日志提交时也发 FLUSH CACHE。
+</div>
+
+<h3>4.2 fsync vs fdatasync</h3>
+
+<table>
+  <tr><th>函数</th><th>同步内容</th><th>同步元数据</th><th>场景</th></tr>
+  <tr>
+    <td><code>fsync(fd)</code></td>
+    <td>数据 + 所有元数据</td>
+    <td>✅ size、atime、mtime、ctime、权限等</td>
+    <td>关键文件、数据库 WAL</td>
+  </tr>
+  <tr>
+    <td><code>fdatasync(fd)</code></td>
+    <td>数据 + "必要"的元数据</td>
+    <td>⚠️ 只同步后续读取所必需的元数据（主要是文件大小 <code>i_size</code>）</td>
+    <td>日志文件、高性能场景</td>
+  </tr>
+</table>
+
+<p><code>fdatasync</code> 的优化点：当你只追加写日志，不修改文件权限/所有者的场景，<code>fdatasync</code> 可能<strong>少刷一些元数据</strong>。但注意：如果文件大小变了（追加写），<code>i_size</code> 是"后续读取必需的"，所以它仍然会被同步。实际性能差异通常不大。</p>
+
+<h3>4.3 O_SYNC / O_DSYNC</h3>
+
+<p>如果你每次 write() 都要同步，可以在 open() 时传 <code>O_SYNC</code>：</p>
+
+<pre>
+fd = open("file.txt", O_WRONLY | O_SYNC);
+write(fd, buf1, 4096);  // 隐式包含 fsync 语义
+write(fd, buf2, 4096);  // 每次 write 都做一次 fsync
+</pre>
+
+<p>但每次 write 都 fsync 性能极差。现实中通常的做法是：<strong>关闭 O_SYNC，在关键时间点手动调用 fsync()</strong>，这样可以在批量写入后一次同步。</p>
+
+<pre>
+// 差
+fd = open("file", O_WRONLY | O_SYNC);
+write(...);  // 每次都 flush
+write(...);
+write(...);
+
+// 好
+fd = open("file", O_WRONLY);
+write(...);
+write(...);
+write(...);
+fsync(fd);   // 一次 flush 所有
+</pre>
+
+<h2>5. 全景回顾：一次带日志的完整写入</h2>
+
+<p>将第四课的 <code>read()</code> 六层全景和第五课的日志机制合一，看看一次 <code>write() + fsync()</code> 的完整路径：</p>
+
+<div class="timeline">
+
+<div class="step-card">
+  <strong>第 1 层：write() 系统调用</strong>
+  <p><code>write(fd, buf, 4096)</code> → <code>vfs_write()</code> → <code>ext4_file_write_iter()</code></p>
+</div>
+
+<div class="step-card">
+  <strong>第 2 层：写入 page cache</strong>
+  <p><code>generic_perform_write()</code> → 分配/获取 folio → <code>copy_page_from_iter()</code>（用户数据→内核页框） → <code>mark_buffer_dirty()</code> 标记脏</p>
+  <p>如果在 <code>data=journal</code> 模式下，这一步还要通过 <code>journal_start()</code> 预留日志空间。</p>
+</div>
+
+<div class="step-card">
+  <strong>第 3 层（如果调用 fsync）：刷脏页 → 数据到磁盘</strong>
+  <p><code>filemap_write_and_wait_range()</code> → <code>ext4_writepages()</code> → <code>mpage_submit_folio()</code> → 构造 BIO → 提交到块层</p>
+  <p>数据块直接写目标位置（ordered 模式）</p>
+</div>
+
+<div class="step-card">
+  <strong>第 4 层（数据刷完后）：日志提交</strong>
+  <p>延迟分配的磁盘块在 <code>writepages</code> 中分配 → inode 更新（extent 树、i_size） → 通过 <code>journal_stop()</code> 触发 JBD2 事务提交</p>
+  <p>事务写入日志区：描述块 → 元数据块 → 提交块</p>
+</div>
+
+<div class="step-card">
+  <strong>第 5 层：FLUSH CACHE 命令</strong>
+  <p><code>blkdev_issue_flush()</code> → 发给磁盘 → 磁盘写缓存中的数据刷到盘片</p>
+</div>
+
+<div class="step-card">
+  <strong>第 6 层：fsync() 返回</strong>
+  <p>所有步骤完成后，<code>fsync()</code> 返回 0。此时数据已安全到达磁盘持久介质。</p>
+</div>
+
+</div>
+
+<h2>6. 知识测验</h2>
+
+<div class="quiz" id="quiz1">
+  <div class="quiz-question">1️⃣ JBD2 为什么需要"提交块（commit block）"？</div>
+  <button class="quiz-option" onclick="cq(this,'wrong')">A. 记录事务的大小，用于日志空间回收</button>
+  <button class="quiz-option" onclick="cq(this,'correct')">B. 作为事务的原子性标记——有提交块表示事务完整，没有则丢弃</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">C. 存储数据块的校验和用于纠错</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">D. 标识该事务属于哪个文件系统</button>
+  <div class="quiz-feedback" id="quiz1-fb">
+    <strong>正确答案：B</strong><br>
+    提交块是事务的"原子提交标记"。只有写入了提交块，恢复时才会回放该事务的数据。如果在写描述块之后就崩溃了，没有提交块 → 被认为是"不完整事务" → 直接丢弃。这就是"原子性"的保障机制。
+  </div>
+</div>
+
+<div class="quiz" id="quiz2">
+  <div class="quiz-question">2️⃣ ext4 默认的日志模式 data=ordered 的核心保证是什么？</div>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">A. 数据和元数据都写日志</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">B. 元数据写日志，数据不写，顺序无要求</button>
+  <button class="quiz-option" onclick="cq2(this,'correct')">C. 元数据写日志，数据不写日志，但数据必须先在目标位置落盘</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">D. 数据和元数据都直接在目标位置写入，日志只记录校验和</button>
+  <div class="quiz-feedback" id="quiz2-fb">
+    <strong>正确答案：C</strong><br>
+    ordered 模式的核心：数据块直接写到目标位置（不经过日志），但<strong>必须在元数据日志提交之前完成</strong>。这保证了即使崩溃后重放日志，inode 指向的数据块一定是已经写好的——不会出现"文件有数据但全是零"的情况。
+  </div>
+</div>
+
+<div class="quiz" id="quiz3">
+  <div class="quiz-question">3️⃣ fsync() 在内核中做了哪三件事？</div>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">A. 写日志 → 写数据 → 写提交块</button>
+  <button class="quiz-option" onclick="cq3(this,'correct')">B. 刷脏页（数据落盘）→ 等待日志提交完成 → 发 FLUSH CACHE 命令到磁盘</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">C. 调回写线程 → 休眠等待 → 唤醒</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">D. 写日志 → 写超级块 → 写 inode 表</button>
+  <div class="quiz-feedback" id="quiz3-fb">
+    <strong>正确答案：B</strong><br>
+    fsync 的三步：① <code>filemap_write_and_wait_range()</code> 刷脏页到数据区；② <code>jbd2_complete_transaction()</code> 等待包含元数据的日志事务提交完成；③ <code>blkdev_issue_flush()</code> 发 FLUSH CACHE 命令穿透磁盘写缓存。三步缺一不可。
+  </div>
+</div>
+
+<div class="quiz" id="quiz4">
+  <div class="quiz-question">4️⃣ fdatasync() 相比 fsync() 可能少同步什么？</div>
+  <button class="quiz-option" onclick="cq4(this,'correct')">A. 不重要的元数据（如 atime，如果后续读取不需要）</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">B. 数据块</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">C. 日志</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">D. FLUSH CACHE 命令</button>
+  <div class="quiz-feedback" id="quiz4-fb">
+    <strong>正确答案：A</strong><br>
+    fdatasync() 只保证"后续数据读取所需的信息"已落盘。如果文件大小没变（只是覆盖写已有位置），某些元数据（如 atime）可以不刷。但如果文件大小变了（追加写），i_size 是必需的，所以仍然会被同步。实际性能差异通常不大。
+  </div>
+</div>
+
+<div class="quiz" id="quiz5">
+  <div class="quiz-question">5️⃣ data=journal 模式下，为什么每个数据块被写两次？</div>
+  <button class="quiz-option" onclick="cq5(this,'wrong')">A. 两次写入用于互为备份</button>
+  <button class="quiz-option" onclick="cq5(this,'correct')">B. 先写日志（保证原子性），再从日志回放到目标位置（保证可访问性）</button>
+  <button class="quiz-option" onclick="cq5(this,'wrong')">C. 一次写数据区、一次写校验区</button>
+  <button class="quiz-option" onclick="cq5(this,'wrong')">D. 一次写主分区、一次写镜像区</button>
+  <div class="quiz-feedback" id="quiz5-fb">
+    <strong>正确答案：B</strong><br>
+    data=journal 模式把所有数据先写入日志区域。事务提交后，JBD2 再从日志区域把数据回放到目标位置。这意味着在没有 checkpoint 完成时，数据在日志中已有备份——崩溃恢复时可以重放。代价就是每个数据块被写两次，吞吐量大幅下降。
+  </div>
+</div>
+
+<h2>7. 小结与下一步</h2>
+
+<p>本课你学到了：</p>
+<ul>
+  <li>✅ <strong>JBD2 日志层</strong>——解决多步写入的原子性问题</li>
+  <li>✅ <strong>事务模型</strong>——handle → transaction → commit checkpoint 的生命周期</li>
+  <li>✅ <strong>三种日志模式</strong>——ordered（默认）、writeback（高性能）、journal（最安全）</li>
+  <li>✅ <strong>崩溃恢复</strong>——完整事务回放，不完整事务丢弃</li>
+  <li>✅ <strong>fsync 三步</strong>——刷脏页 → 日志提交 → FLUSH CACHE</li>
+  <li>✅ <strong>fsync vs fdatasync vs O_SYNC</strong>——同步粒度的选择</li>
+</ul>
+
+<p>接下来：</p>
+<ul>
+  <li><strong>第六课</strong>：虚拟文件系统（procfs、sysfs、tmpfs）——没有磁盘的文件系统怎么工作？</li>
+  <li>或者进入 <strong>I/O 模块</strong>：从 BIO、块层、多队列（blk-mq）、I/O 调度器一路深入到磁盘驱动</li>
+</ul>
+
+<blockquote>
+  <strong>📮 有疑问？</strong> 关于 journal 还有什么不清楚的随时来问！比如 checkpoint 的具体触发条件、撤销块（revoke block）的作用、barrier 与 FLUSH CACHE 的关系等都可以深挖。<br><br>
+  <strong>📚 推荐资料</strong>：<em>Linux Kernel Development</em> (Robert Love) 第 18 章——关于 ext4 和 journaling 有非常清晰的讲解。<code>tune2fs -l /dev/sda1 | grep Journal</code> 查看你系统上的日志参数。
+</blockquote>
+
+<script>
+function cq(btn,result){var p=btn.parentElement,fb=p.querySelector('.quiz-feedback');p.querySelectorAll('.quiz-option').forEach(function(b){return b.classList.remove('selected','correct','wrong');});btn.classList.add('selected',result);fb.classList.add('show');fb.className='quiz-feedback show '+result;}
+function cq2(btn,result){cq(btn,result);}
+function cq3(btn,result){cq(btn,result);}
+function cq4(btn,result){cq(btn,result);}
+function cq5(btn,result){cq(btn,result);}
+</script>
+
+</body>
+</html>
