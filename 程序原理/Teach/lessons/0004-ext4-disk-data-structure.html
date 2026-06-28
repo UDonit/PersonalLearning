@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第四课：ext4 磁盘数据结构深度解析</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+<style>
+  .step-flow { counter-reset: step; margin: 1.5em 0; }
+  .step {
+    counter-increment: step;
+    margin: 1em 0;
+    padding: 0.8rem 1rem 0.8rem 3.2rem;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    position: relative;
+    box-shadow: 0 1px 3px var(--shadow);
+  }
+  .step::before {
+    content: counter(step);
+    position: absolute;
+    left: 0.6rem;
+    top: 0.8rem;
+    width: 1.8rem; height: 1.8rem;
+    background: var(--accent);
+    color: white;
+    font-weight: 500;
+    font-size: 0.85rem;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .disk-map {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem;
+    margin: 0.5em 0;
+    background: white;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .tag { display: inline-block; font-size: 0.75rem; padding: 0.1em 0.4em; border-radius: 3px; color: white; margin-right: 0.2em; }
+  .tag-green { background: #337733; }
+  .tag-blue { background: #2e6b9e; }
+  .tag-orange { background: #e65100; }
+  .tag-purple { background: #673ab7; }
+  .tag-red { background: #c62828; }
+  .tag-gray { background: #6b6760; }
+</style>
+</head>
+<body>
+
+<h1>💾 第四课：ext4 磁盘数据结构深度解析</h1>
+
+<div class="lesson-meta">
+  <strong>主题</strong>：ext4 的物理磁盘布局 — 块组、inode 表、目录项、extent 树、延迟分配<br>
+  <strong>前置知识</strong>：前三课（VFS 四对象、open/read 路径、page cache）<br>
+  <strong>预估时间</strong>：35–45 分钟
+</div>
+
+<h2>从"内存"到"磁盘"——补齐最后一环</h2>
+
+<p>前三课我们完整走过了从用户态到 VFS 到 page cache 的路径，但一直回避了一个问题：<strong>数据在磁盘上到底是怎么存的？</strong></p>
+
+<p>第一课的 inode 说"存了数据块指针"，第二课的 ext4_lookup() 说"读目录文件内容"——但我们从没看过这些"磁盘上的东西"长什么样。这一课补上。</p>
+
+<h2>1. ext4 磁盘分区全景</h2>
+
+<p>一个 ext4 分区（块设备）格式化后被划分为多个 <strong>块组（Block Group）</strong>。每个块组是一个独立的"管理单元"，有自己独立的 inode 表、数据块位图。</p>
+
+<div class="disk-map">
+<span class="tag tag-blue">引导扇区</span> <span class="tag tag-orange">块组0</span> | <span class="tag tag-orange">块组1</span> | <span class="tag tag-orange">块组2</span> | …… | <span class="tag tag-orange">块组N-1</span>
+
+<span class="tag tag-orange">块组0 内部：</span>
+┌────────────┬────────────┬────────────┬──────────────┬──────────────────────┐
+│ Superblock │  Group      │  Block     │  Inode       │  Inode Table         │
+│ (超级块)   │  Descriptor│  Bitmap    │  Bitmap      │  (inode 条目连续存放) │
+│            │  Table     │            │              │                      │
+│ [1024B]    │  [N×32B]   │  [1块]     │  [1块]       │  [N块]               │
+└────────────┴────────────┴────────────┴──────────────┴──────────────────────┘
+
+─────────────────────────────────────────────────────────────────────────────►
+
+                                                                 Data Blocks
+                                                                 (文件内容、
+                                                                 目录数据)
+</div>
+
+<p>关键参数来自 <code>tune2fs -l /dev/sda1</code>（以 1TB 分区为例）：</p>
+
+<table>
+  <tr><th>参数</th><th>值</th><th>含义</th></tr>
+  <tr><td><strong>Block count</strong></td><td>26214400</td><td>总共 26214400 个块（每个块 4KB = 1TB）</td></tr>
+  <tr><td><strong>Inode count</strong></td><td>6553600</td><td>格式化时定死的 inode 总数（约每 16KB 一个 inode）</td></tr>
+  <tr><td><strong>Inodes per group</strong></td><td>8192</td><td>每个块组可容纳 8192 个 inode</td></tr>
+  <tr><td><strong>Blocks per group</strong></td><td>32768</td><td>每个块组 32768 个块（128MB）</td></tr>
+  <tr><td><strong>Inode size</strong></td><td>256</td><td>每个 inode 条目 256 字节（ext2/3 是 128B）</td></tr>
+  <tr><td><strong>First inode</strong></td><td>11</td><td>最早可用的 inode 号从 #11 开始（#1=坏块,#2=根目录）</td></tr>
+</table>
+
+<p><strong>计算</strong>：块组总数 = 26214400 ÷ 32768 = 800 个块组。每个块组中 inode 表占用 = 8192 × 256 ÷ 4096 = 512 个块。</p>
+
+<div class="insight">
+  <strong>💡 关键限制</strong>：inode 总数在 <code>mkfs.ext4</code> 时就定死了。如果分区里有很多小文件（每个文件一个 inode），inode 用完了即使磁盘还有空间也创建不了新文件。<code>df -i</code> 看 inode 使用率。
+</div>
+
+<h2>2. inode 的磁盘结构（256 字节）</h2>
+
+<p>内存中的 <code>struct inode</code> 是从磁盘上的 <code>struct ext4_inode</code> 加载而来的。来看看磁盘上真正存了什么：</p>
+
+<pre style="font-size:0.78rem;">
+// fs/ext4/ext4.h — ext4_inode 的磁盘布局（只列关键字段）
+struct ext4_inode {
+    __le16  i_mode;            // 0x00 文件类型 + 权限位（S_IFREG|S_IFDIR|S_IFLNK等）
+    __le16  i_uid;             // 0x02 所有者 UID（低 16 位）
+    __le32  i_size_lo;         // 0x04 文件大小（低 32 位）
+    __le32  i_atime;           // 0x08 最后访问时间
+    __le32  i_ctime;           // 0x0C 创建时间
+    __le32  i_mtime;           // 0x10 修改时间
+    __le32  i_dtime;           // 0x14 删除时间
+    __le16  i_gid;             // 0x18 GID（低 16 位）
+    __le16  i_links_count;     // 0x1A 硬链接计数（i_nlink 的磁盘副本）
+    __le32  i_blocks_lo;       // 0x1C 数据块数量（512 字节块为单位）
+    __le32  i_flags;           // 0x20 文件标志（EXT4_EXTENTS_FL 等）
+    // ...
+    __le32  i_block[EXT4_N_BLOCKS];  // 0x28 数据块指针 —— 最关键的部分
+    //         ↑ ext2/ext3: 15 个 32 位块号（直接+间接+二级+三级）
+    //         ↑ ext4: 如果设置了 EXT4_EXTENTS_FL，这 15 个值组成 extent 树的根节点
+    // ...
+    __le32  i_generation;      // 0x64 inode 代次（NFS 句柄防重用）
+    __le32  i_file_acl_lo;     // 0x68 扩展属性块
+    __le32  i_size_high;       // 0x6C 文件大小（高 32 位，支持大文件）
+    __le32  i_obso_faddr;      // 0x70 碎片地址（已废弃）
+    // ... （128 字节后是 ext4 扩展部分）
+    __le16  i_extra_isize;     // 0x80 扩展部分大小（如 32 字节）
+    __le16  i_checksum_hi;     // 0x82 inode 校验和
+    __le32  i_ctime_extra;     // 0x84 纳秒级时间戳
+    __le32  i_mtime_extra;     // 0x88
+    __le32  i_atime_extra;     // 0x8C
+    __le32  i_crtime;          // 0x90 文件创建时间（不是 ctime！）
+    __le32  i_crtime_extra;    // 0x94
+    __le32  i_version_hi;      // 0x98 版本号（高 32 位）
+    __le32  i_projid;          // 0x9C 项目 ID（配额用）
+};
+</pre>
+
+<h3>2.1 核心字段的用途</h3>
+
+<table>
+  <tr><th>字段</th><th>字节偏移</th><th>说明</th></tr>
+  <tr><td><code>i_mode</code></td><td>0x00</td><td>最低 9 位 = 权限（rwxrwxrwx），高 4 位 = 文件类型。掩码：<code>S_IFMT = 0xF000</code></td></tr>
+  <tr><td><code>i_size_lo + i_size_high</code></td><td>0x04 + 0x6C</td><td>64 位文件大小，理论最大 16EB（ext4 实际限制 16TB）</td></tr>
+  <tr><td><code>i_links_count</code></td><td>0x1A</td><td>硬链接计数。内存中对应 <code>inode->i_nlink</code></td></tr>
+  <tr><td><code>i_block[15]</code></td><td>0x28</td><td>数据块指针——这是 inode 中最复杂的部分，往下详述</td></tr>
+  <tr><td><code>i_crtime</code></td><td>0x90</td><td>文件创建时间（cr = creation）。ext4 新增，ext2/3 没有这个字段。注意和 <code>ctime</code>（元数据修改时间）不同。</td></tr>
+</table>
+
+<h2>3. 数据块指针：从间接块到 Extent 树</h2>
+
+<h3>3.1 ext2/ext3 的方式：间接块映射</h3>
+
+<p>在 ext2/ext3 中，inode 的 <code>i_block[15]</code> 是这样用的：</p>
+
+<div class="disk-map">
+i_block[15] 数组（15 个 32 位块号）：
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│  0 │  1 │  2 │  3 │  4 │  5 │  6 │  7 │  8 │  9 │ 10 │ 11 │ 12 │ 13 │ 14 │
+└─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴──┘
+  │    │    │    │    │    │    │    │    │    │    │    │    │    │    │
+  ▼    ▼    ▼    ▼    ▼    直接块（0-11）：直接指向数据块，共 12 个块 = 48KB
+
+                         ┌───────┐
+                   12 ──→│间接块  │  指向一个"存块号的块"（含 1024 个块号）→ 1024 个数据块
+                         └───────┘
+
+                         ┌───────┐
+                   13 ──→│二级间接│→ 指向 1024 个间接块 → 每个间接块 1024 个数据块
+                         └───────┘    → 共 1024×1024 = 1M 个块
+
+                         ┌───────┐
+                   14 ──→│三级间接│→ 指向 1024 个二级间接 → → → 1024³ 个数据块
+                         └───────┘    → 最大文件约 4TB（32 位块号限制）
+</pre>
+
+<p><strong>问题</strong>：一个 1GB 文件用间接块映射，需要读取多个间接块才能找到数据——尤其随机访问大文件时，读一个数据块可能要先读 3 次间接块（三级间接）。</p>
+
+<h3>3.2 ext4 的方式：Extent 树</h3>
+
+<p>ext4 引入 <strong>extent（扩展区）</strong>——一段<strong>连续的</strong>物理块范围。用一个 <code>struct ext4_extent</code> 就可以表示一大段连续的数据，而不需要一个块一个块地列举。</p>
+
+<pre style="font-size:0.78rem;">
+// fs/ext4/ext4_extents.h
+// 一个 extent 条目 —— 只占 12 字节
+struct ext4_extent {
+    __le32  ee_block;    // 文件中的逻辑块号（起始）
+    __le16  ee_len;      // 块数（最多 32768 个块 = 128MB）
+    __le16  ee_start_hi; // 物理块号（高 16 位）
+    __le32  ee_start_lo; // 物理块号（低 32 位）
+};
+// → 12 字节表示一个 128MB 的连续区域！
+
+// ext2/ext3 时代的对比：
+// 12 字节 = 3 个块号指针 → 只能存 3 个 4KB 块 = 12KB 数据
+// 而一个 extent 可以存 128MB 数据
+</pre>
+
+<p>如果一个文件是顺序写入的（大部分文件都是），可能只需要一个 extent：</p>
+
+<div class="disk-map">
+32MB 的文件（8192 个块），连续分配：
+┌────────────────────────────────────────────────────────────────────────┐
+│ 一个 extent 就够了：                                                    │
+│   ee_block = 0,  ee_len = 8192,  ee_start = 10000                      │
+│   → 文件逻辑块 0~8191 对应物理块 10000~18191                            │
+│   → inode 的 i_block[15] 总共 60 字节就能存下                          │
+└────────────────────────────────────────────────────────────────────────┘
+
+大文件（如 2GB，524288 个块）被磁盘碎片打断：
+
+┌──────────────────┐ ┌──────────────┐ ┌───────────┐ ┌──────────────────┐
+│ extent 0          │ │ extent 1     │ │ extent 2  │ │ extent 3         │
+│ 逻辑: 0~65535      │ │ 65536~131071 │ │ 131072~   │ │ 196608~262143     │
+│ 物理: 10000~75535 │ │ 90000~154535 │ │ 200000~   │ │ 300000~365535     │
+│ 长度: 65536 块     │ │ 65536 块     │ │ 65536 块  │ │ 65536 块          │
+└──────────────────┘ └──────────────┘ └───────────┘ └──────────────────┘
+→ 4 个 extent，每个 12 字节，总共 48 字节 + 节点开销 ≈ 60 字节
+→ 同一个文件在 ext3 下需要：524288 个块号 + 512 个间接块 = 2MB+ 的元数据
+</pre>
+
+<div class="insight">
+  <strong>💡 extent 树的巨大优势</strong>：对连续分配的大文件，extent 树的元数据开销比间接块映射小 <strong>1000 倍以上</strong>。即使文件碎片化，extent 的数量通常也只有几十到几百个（几十个 12 字节的 extent 条目就能描述数 GB 的文件），在 inode 的 <code>i_block[]</code> 空间内就能存下——大多数情况下 <strong>不需要额外的磁盘 I/O 来读取元数据</strong>。
+</div>
+
+<h3>3.3 Extent 树的完整结构</h3>
+
+<p>当 extent 数量超过 inode 中 i_block[15] 能存下的（4 个 extent，60 字节）时，ext4 会构建一棵树：</p>
+
+<div class="figure">
+<svg viewBox="0 0 640 200" width="640" height="200" style="max-width:100%;height:auto;">
+  <!-- 根节点（在 inode 的 i_block[] 中） -->
+  <rect x="250" y="10" width="140" height="36" rx="5" fill="#fff8e6" stroke="#d4a017" stroke-width="1.5"/>
+  <text x="320" y="32" text-anchor="middle" font-size="11" font-weight="500">extent 根节点</text>
+  <text x="320" y="44" text-anchor="middle" font-size="9" fill="#666">（存在 i_block[15] 中）</text>
+
+  <!-- 中间节点 -->
+  <rect x="250" y="70" width="140" height="36" rx="5" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2"/>
+  <text x="320" y="92" text-anchor="middle" font-size="11">extent 中间节点</text>
+
+  <line x1="320" y1="46" x2="320" y2="70" stroke="#6b6760" stroke-width="1.2"/>
+
+  <!-- 叶节点 = extent 条目 -->
+  <rect x="40" y="130" width="120" height="36" rx="5" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="100" y="152" text-anchor="middle" font-size="10">extent 叶节点</text>
+  <text x="100" y="164" text-anchor="middle" font-size="8" fill="#666">[逻辑0, 物理10000, 长度65536]</text>
+
+  <rect x="250" y="130" width="140" height="36" rx="5" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="320" y="152" text-anchor="middle" font-size="10">extent 叶节点</text>
+  <text x="320" y="164" text-anchor="middle" font-size="8" fill="#666">[逻辑65536, 物理90000, 长度65536]</text>
+
+  <rect x="460" y="130" width="140" height="36" rx="5" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="530" y="152" text-anchor="middle" font-size="10">extent 叶节点</text>
+  <text x="530" y="164" text-anchor="middle" font-size="8" fill="#666">[逻辑131072, 物理200000, 长度65536]</text>
+
+  <line x1="250" y1="106" x2="100" y2="130" stroke="#6b6760" stroke-width="0.8"/>
+  <line x1="320" y1="106" x2="320" y2="130" stroke="#6b6760" stroke-width="0.8"/>
+  <line x1="390" y1="106" x2="530" y2="130" stroke="#6b6760" stroke-width="0.8"/>
+</svg>
+<figcaption>extent 树。根节点在 inode 的 i_block[15] 中。叶节点存实际的 extent 条目（逻辑块号→物理块号范围）。树高通常为 2（根+叶），最深 4 层。</figcaption>
+</div>
+
+<h2>4. 目录文件的内容（目录项结构）</h2>
+
+<p>目录在 ext4 中是一个"特殊文件"——它的数据块里存的就是一串<strong>目录项（directory entry）</strong>。这就是第二课中 lookup() 查找的目标。</p>
+
+<pre style="font-size:0.78rem;">
+// fs/ext4/ext4.h
+// 磁盘上的目录项结构（紧凑模式）
+struct ext4_dir_entry_2 {
+    __le32  inode;         // inode 号（4 字节）—— 指向文件/目录的 inode
+    __le16  rec_len;       // 本条自录项的长度（2 字节，用于跳到下一个）
+    __u8    name_len;      // 文件名长度（1 字节）
+    __u8    file_type;     // 文件类型（1 字节）
+    char    name[255];     // 文件名（变长，实际长度由 name_len 指定）
+};
+
+// 一个典型的目录文件内容（十六进制视角）：
+// 块偏移  内容
+// 0x000:  [inode=2] [rec_len=12] [name_len=1] [type=2] "."       ← 当前目录
+// 0x00C:  [inode=2] [rec_len=12] [name_len=2] [type=2] ".."      ← 父目录（根目录的父目录也是自己）
+// 0x018:  [inode=11] [rec_len=16] [name_len=7] [type=2] "lost+found"
+// 0x028:  [inode=12] [rec_len=12] [name_len=4] [type=2] "home"
+// 0x034:  [inode=45] [rec_len=12] [name_len=4] [type=2] "usr"
+// 0x040:  [inode=78] [rec_len=12] [name_len=6] [type=2] "share"
+// 0x04C:  [inode=1065432] [rec_len=X] [name_len=7] [type=1] "doc.txt"  ← 我们一直在找的文件
+</pre>
+
+<div class="figure">
+<svg viewBox="0 0 640 120" width="640" height="120" style="max-width:100%;height:auto;">
+  <!-- 目录项布局 -->
+  <rect x="20" y="20" width="620" height="80" rx="6" fill="#f5f5f5" stroke="#6b6760" stroke-width="1"/>
+  <text x="330" y="16" text-anchor="middle" font-size="11" font-weight="500">目录文件的数据块内容（一串"捏合"的目录项）</text>
+
+  <!-- dir entry 0 -->
+  <rect x="30" y="35" width="50" height="22" rx="2" fill="#fff9c4" stroke="#f57f17" stroke-width="1"/>
+  <text x="55" y="48" text-anchor="middle" font-size="7" fill="#f57f17">inode=2</text>
+  <rect x="80" y="35" width="30" height="22" rx="2" fill="#f5f5f5" stroke="#999" stroke-width="0.5"/>
+  <text x="95" y="48" text-anchor="middle" font-size="7">len=12</text>
+  <rect x="110" y="35" width="30" height="22" rx="2" fill="#f5f5f5" stroke="#999" stroke-width="0.5"/>
+  <text x="125" y="48" text-anchor="middle" font-size="7">type=2</text>
+  <rect x="140" y="35" width="25" height="22" rx="2" fill="#e3f2fd" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="152" y="48" text-anchor="middle" font-size="7">"."</text>
+
+  <!-- dir entry 1 -->
+  <rect x="175" y="35" width="50" height="22" rx="2" fill="#fff9c4" stroke="#f57f17" stroke-width="1"/>
+  <text x="200" y="48" text-anchor="middle" font-size="7" fill="#f57f17">inode=12</text>
+  <rect x="225" y="35" width="30" height="22" rx="2" fill="#f5f5f5" stroke="#999" stroke-width="0.5"/>
+  <text x="240" y="48" text-anchor="middle" font-size="7">len=12</text>
+  <rect x="255" y="35" width="30" height="22" rx="2" fill="#f5f5f5" stroke="#999" stroke-width="0.5"/>
+  <text x="270" y="48" text-anchor="middle" font-size="7">type=2</text>
+  <rect x="285" y="35" width="40" height="22" rx="2" fill="#e3f2fd" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="305" y="48" text-anchor="middle" font-size="7">"home"</text>
+
+  <!-- dir entry 2 -->
+  <rect x="340" y="35" width="50" height="22" rx="2" fill="#fff9c4" stroke="#f57f17" stroke-width="1"/>
+  <text x="365" y="48" text-anchor="middle" font-size="7" fill="#f57f17">inode=1065432</text>
+  <rect x="390" y="35" width="30" height="22" rx="2" fill="#f5f5f5" stroke="#999" stroke-width="0.5"/>
+  <text x="405" y="48" text-anchor="middle" font-size="7">len=12</text>
+  <rect x="420" y="35" width="30" height="22" rx="2" fill="#f5f5f5" stroke="#999" stroke-width="0.5"/>
+  <text x="435" y="48" text-anchor="middle" font-size="7">type=1</text>
+  <rect x="450" y="35" width="55" height="22" rx="2" fill="#e3f2fd" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="477" y="48" text-anchor="middle" font-size="7">"doc.txt"</text>
+
+  <!-- 图例 -->
+  <text x="30" y="75" font-size="9" fill="#f57f17">■ inode 号</text>
+  <text x="130" y="75" font-size="9" fill="#999">■ rec_len</text>
+  <text x="210" y="75" font-size="9" fill="#999">■ type</text>
+  <text x="270" y="75" font-size="9" fill="#2e6b9e">■ 文件名</text>
+</svg>
+<figcaption>目录文件的内容就是"inode号 + 文件名"的条目列表。ext4_lookup() 就是顺序扫描这个列表。</figcaption>
+</div>
+
+<h3>hash 树目录索引（dir_index）</h3>
+
+<p>如果你在一个大目录下放了几万个文件，<code>ext4_lookup()</code> 还是遍历扫描吗？</p>
+
+<p>不会。ext4 默认启用了 <strong>htree（哈希树目录索引）</strong>——把目录项用哈希树组织起来，使大目录下的查找从 O(N) 变为 O(log N)。</p>
+
+<pre style="font-size:0.78rem;">
+// 开启 dir_index 后，目录文件的结构变为：
+//
+// 目录文件的第 0 块（dx_root）：
+// ┌────────────────────────────┐
+// │ 普通目录项："." / ".."     │
+// ├────────────────────────────┤
+// │ dx_root_info（索引信息）    │
+// │   hash_version = 1         │
+// │   info_length = 8          │
+// │   indirect_levels = 1      │
+// ├────────────────────────────┤
+// │ htree 根节点                │
+// │   [hash=0x0000, block=1]   │  ← 哈希值 0x0000~0x3FFF 的条目在块 1
+// │   [hash=0x4000, block=2]   │  ← 哈希值 0x4000~0x7FFF 的条目在块 2
+// │   [hash=0x8000, block=3]   │  ← ...
+// │   [hash=0xC000, block=4]   │
+// └────────────────────────────┘
+//
+// 块 1-4：实际的目录项（按文件名哈希排序后排列）
+// 查找 "doc.txt" 时：
+//   ① 计算 "doc.txt" 的哈希值 → 比如 0x1234
+//   ② 在索引块二分查找 → 落在 0x0000~0x3FFF 区间 → 去块 1
+//   ③ 在块 1 中二分查找 "doc.txt"
+//   ④ O(log N) 而不是 O(N)
+
+tune2fs -l /dev/sda1 | grep "Filesystem features"
+// 输出中应该包含 "dir_index"
+</pre>
+
+<h2>5. 延迟分配（Delayed Allocation / delalloc）</h2>
+
+<p>这是 ext4 相对 ext3 的一个关键性能特性。ext3 的语义是在 write() 系统调用路径上就要分配磁盘块，而 ext4 推迟到数据真正回写到磁盘时才分配。</p>
+
+<h3>ext3 的方式：立即分配</h3>
+
+<pre style="font-size:0.78rem;">
+write(fd, buf1, 4KB);
+  → ext3 立即找 4KB 空闲块
+  → 写入数据
+  → 更新 inode 的块指针
+  → 如果文件是追加写，但磁盘碎片严重，每次 4KB 散落在不同位置
+
+write(fd, buf2, 4KB);
+  → 又找 4KB 空闲块（可能离上一个很远）
+  → ...
+</pre>
+
+<p><strong>后果</strong>：如果程序多次小批量写入，文件在磁盘上碎片化严重——每个 4KB 块不连续，读的时候需要多次寻道。</p>
+
+<h3>ext4 的方式：延迟到回写时</h3>
+
+<pre style="font-size:0.78rem;">
+write(fd, buf1, 4KB);
+  → 写入 page cache，标记脏
+  → 还没分配磁盘块！ ✓
+
+write(fd, buf2, 4KB);
+  → 写入 page cache（同一页或下一页），标记脏
+  → 还没分配磁盘块！ ✓
+
+write(fd, buf3, 4KB);
+  → ... 同上
+
+flusher 线程回写（或内存压力）：
+  → 检查 inode 有多少脏页 → 64KB
+  → ext4 一次为这 64KB 找一段空闲块
+  → 分配连续区域（一次寻道）
+  → 写入所有数据
+  → 更新 inode 的 extent 树（只需一个 extent 条目！）
+</pre>
+
+<div class="insight">
+  <strong>💡 延迟分配的好处</strong>：将多次小的写入合并为一次大的连续分配，既减少了磁盘碎片、又减少了 extent 树的条目数。大多数文件系统基准测试中，delalloc 可以带来 2-3 倍的写入性能提升。潜在缺点是：如果系统在回写前崩溃，数据丢失范围更大（因为更多未分配块的数据在 page cache 中）。
+</div>
+
+<h2>6. 一次 read() 的磁盘 I/O 全景——把所有课程串起来</h2>
+
+<p>现在我们可以把四课知识合并，画出一个完整的 read() 从应用到磁盘磁道的全景了：</p>
+
+<div class="step-flow">
+
+<div class="step">
+  <strong>第 1 层：用户态 → 系统调用</strong>
+  <p><code>read(3, buf, 4096)</code> → syscall 切换到内核态</p>
+  <p><strong>涉及课程</strong>：第二课（系统调用入口）</p>
+</div>
+
+<div class="step">
+  <strong>第 2 层：VFS → file_operations</strong>
+  <p><code>vfs_read()</code> → <code>file->f_op->read_iter()</code> → <code>ext4_file_read_iter()</code></p>
+  <p><strong>涉及课程</strong>：第一课（file 对象、f_op 函数表）、第二课（open 建立引用链）</p>
+</div>
+
+<div class="step">
+  <strong>第 3 层：Page Cache 查找</strong>
+  <p><code>filemap_read()</code> → <code>filemap_get_folio()</code> → 在 <code>address_space->i_pages</code>（xarray）中查找</p>
+  <p>✅ 命中 → <code>copy_page_to_iter()</code> → 返回（零 I/O）</p>
+  <p>❌ 未命中 → 继续下一步</p>
+  <p><strong>涉及课程</strong>：第三课（page cache、xarray、预读）</p>
+</div>
+
+<div class="step">
+  <strong>第 4 层：读 inode → 找数据块位置</strong>
+  <p>ext4 从 inode 中读取 <code>i_block[]</code> 或遍历 extent 树，得到文件偏移对应的<strong>物理块号</strong>。</p>
+  <p>如果 extent 树很小（叶子节点在 inode 内），这一步只需要读 inode 本身（已在内存）。</p>
+  <p><strong>涉及课程</strong>：第四课（extent 树、数据块指针）</p>
+</div>
+
+<div class="step">
+  <strong>第 5 层：提交 BIO → 块层 → I/O 调度器 → 磁盘驱动</strong>
+  <p>构造 <code>struct bio</code>（包含物理块号、长度、方向），提交到通用块层 → I/O 调度器排队、合并 → 磁盘驱动 → DMA 到 page cache 页框中。</p>
+  <p><strong>涉及课程</strong>：第三课（a_ops->read_folio 之后）、第四课（物理块号从 inode 来）</p>
+</div>
+
+<div class="step">
+  <strong>第 6 层：数据回到用户态</strong>
+  <p>I/O 完成 → page cache 页标记为 uptodate → 唤醒等待的进程 → <code>copy_page_to_iter()</code> 将数据复制到用户缓冲区 → 返回字节数。</p>
+  <p><strong>涉及课程</strong>：第三课（page cache 完成路径）</p>
+</div>
+
+</div>
+
+<h2>7. 知识测验</h2>
+
+<div class="quiz" id="quiz1">
+  <div class="quiz-question">1️⃣ ext4 中 inode 总数是在什么时候确定的？</div>
+  <button class="quiz-option" onclick="cq(this,'wrong')">A. 第一次创建文件时</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">B. 挂载时</button>
+  <button class="quiz-option" onclick="cq(this,'correct')">C. mkfs.ext4 格式化时</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">D. 内核编译时</button>
+  <div class="quiz-feedback" id="quiz1-fb">
+    <strong>正确答案：C</strong><br>
+    格式化时根据分区大小和 inode_ratio（默认 16384 字节一个 inode）定死。之后即使磁盘还有空间，inode 耗尽也无法创建新文件。<code>df -i</code> 查看 inode 使用率。
+  </div>
+</div>
+
+<div class="quiz" id="quiz2">
+  <div class="quiz-question">2️⃣ ext4 的 extent 相比 ext3 的间接块映射，最大的优势是什么？</div>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">A. 支持更大的磁盘容量</button>
+  <button class="quiz-option" onclick="cq2(this,'correct')">B. 用极小的元数据表示连续磁盘区域，减少元数据 I/O</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">C. 支持更快的 crc 校验</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">D. 允许多个文件共享数据块</button>
+  <div class="quiz-feedback" id="quiz2-fb">
+    <strong>正确答案：B</strong><br>
+    一个 extent（12 字节）可以表示最多 128MB 的连续区域。对于连续分配的大文件，extent 的元数据开销比间接块映射小 1000 倍以上——而且在 inode 的 i_block[] 空间中就能存下，多数情况不需要额外 I/O 来读取元数据。选项 A 是 48 位块号的作用，不是 extent 本身的优势。
+  </div>
+</div>
+
+<div class="quiz" id="quiz3">
+  <div class="quiz-question">3️⃣ 延迟分配（delalloc）的主要作用是什么？</div>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">A. 减少 CPU 占用</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">B. 加快文件删除速度</button>
+  <button class="quiz-option" onclick="cq3(this,'correct')">C. 将多次小写入合并为一次大的连续分配，减少碎片和元数据</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">D. 减少内存占用</button>
+  <div class="quiz-feedback" id="quiz3-fb">
+    <strong>正确答案：C</strong><br>
+    delalloc 将块分配推迟到回写时，让 flusher 能看到"这个 inode 共有多少脏页"然后再一次性分配连续空间。这既减少了磁盘碎片（分配的是连续块），又减少了 extent 树条目数（一个大的 extent 代替多个小的）。潜在的代价是如果崩溃丢了 page cache，数据损失范围更大。
+  </div>
+</div>
+
+<div class="quiz" id="quiz4">
+  <div class="quiz-question">4️⃣ 在 ext4 大目录（10 万个文件）中查找一个文件，ext4_lookup() 怎么保证不是 O(N) 的？</div>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">A. 把所有文件名缓存在 dcache 中</button>
+  <button class="quiz-option" onclick="cq4(this,'correct')">B. 使用 htree 哈希树索引，O(log N) 查找</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">C. 在 inode 中存储文件名→inode 的哈希表</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">D. 每次创建文件时更新超级块的目录索引</button>
+  <div class="quiz-feedback" id="quiz4-fb">
+    <strong>正确答案：B</strong><br>
+    ext4 默认启用 dir_index 特性，目录文件以 htree（哈希树）组织。查找时先计算文件名哈希值，在索引块中二分查找定位到对应的叶块，再到叶块中二分查找。选项 A 中 dcache 只在内存中缓存已访问过的 dentry——第一次冷访问仍然要读磁盘，不能依赖 dcache 来解决冷启动性能。
+  </div>
+</div>
+
+<h2>8. 小结与下一步</h2>
+
+<p>本课你学到了：</p>
+<ul>
+  <li>✅ ext4 分区布局：块组（Block Group）是管理单元，每个块组有独立的 inode 表</li>
+  <li>✅ inode 磁盘结构：256 字节，包含 mode/uid/gid/时间戳/数据块指针</li>
+  <li>✅ Extent 树 vs 间接块映射：extent 一个条目（12 字节）代替了数千个块号</li>
+  <li>✅ 目录文件结构：一串"inode号+文件名"的目录项，大目录用 htree 加速到 O(log N)</li>
+  <li>✅ 延迟分配（delalloc）：将块分配推迟到回写时，合并为一次大的连续分配</li>
+  <li>✅ 一次 read() 从应用到磁盘的六层全景</li>
+</ul>
+
+<p>接下来：</p>
+<ul>
+  <li><strong>第五课</strong>：ext4 Journal（JBD2）与 fsync——崩溃恢复与数据耐久性</li>
+</ul>
+
+<blockquote>
+  <strong>📮 有疑问？</strong> 继续问！ext4 还有很多细节可以深挖——比如 inline data（小文件直接存 inode 中）、加密、文件系统一致性检查（e2fsck）等。<br><br>
+  <strong>📚 推荐资料</strong>：<a href="https://docs.kernel.org/filesystems/ext4/index.html" target="_blank">内核 ext4 官方文档</a>（有完整的磁盘数据结构说明）；<em>Linux Kernel Development</em> (Robert Love) 第 18 章；<code>tune2fs -l /dev/sda1</code> 查看你自己的 ext4 参数。
+</blockquote>
+
+<script>
+function cq(btn,result){var p=btn.parentElement,fb=p.querySelector('.quiz-feedback');p.querySelectorAll('.quiz-option').forEach(function(b){return b.classList.remove('selected','correct','wrong');});btn.classList.add('selected',result);fb.classList.add('show');fb.className='quiz-feedback show '+result;}
+function cq2(btn,result){cq(btn,result);}
+function cq3(btn,result){cq(btn,result);}
+function cq4(btn,result){cq(btn,result);}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第三课：read() 的完整旅程与 Page Cache 深度解析</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+<style>
+  .step-flow { counter-reset: step; margin: 1.5em 0; }
+  .step {
+    counter-increment: step;
+    margin: 1em 0;
+    padding: 0.8rem 1rem 0.8rem 3.2rem;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    position: relative;
+    box-shadow: 0 1px 3px var(--shadow);
+  }
+  .step::before {
+    content: counter(step);
+    position: absolute;
+    left: 0.6rem;
+    top: 0.8rem;
+    width: 1.8rem; height: 1.8rem;
+    background: var(--accent);
+    color: white;
+    font-weight: 500;
+    font-size: 0.85rem;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step .src {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--muted);
+    display: block;
+    margin-top: 0.3rem;
+  }
+
+  .layer-box {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 0.8em 0;
+    background: white;
+  }
+  .layer-box h4 { margin: 0 0 0.3em; }
+
+  .flow-col { display: flex; flex-direction: column; gap: 0.8rem; margin: 1.2em 0; }
+  .flow-row { display: flex; align-items: flex-start; gap: 1rem; }
+  .flow-badge {
+    flex-shrink: 0;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    padding: 0.2em 0.5em;
+    border-radius: 4px;
+    color: white;
+    min-width: 4.5em;
+    text-align: center;
+  }
+  .badge-green { background: #337733; }
+  .badge-blue { background: #2e6b9e; }
+  .badge-orange { background: #e65100; }
+  .badge-purple { background: #673ab7; }
+  .flow-content { flex: 1; }
+
+  .radix-tree-vis {
+    display: flex; gap: 0.3rem; margin: 0.5em 0;
+  }
+  .rt-level { display: flex; flex-direction: column; gap: 0.2rem; align-items: center; }
+  .rt-node {
+    display: flex; align-items: center; justify-content: center;
+    width: 40px; height: 30px;
+    border: 1px solid #999; border-radius: 4px;
+    background: #f5f5f5;
+    font-size: 0.7rem; font-family: var(--mono);
+  }
+  .rt-node.active { background: #e3f2e0; border-color: #337733; }
+  .rt-node.ar { background: #fff8e6; border-color: #d4a017; }
+
+  .hit-rate-table td { font-size: 0.85rem; }
+  .hit-rate-table td:first-child { font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<h1>📖 第三课：read() 的完整旅程与 Page Cache</h1>
+
+<div class="lesson-meta">
+  <strong>主题</strong>：read() 系统调用的逐层路径 + Page Cache 的工作原理<br>
+  <strong>前置知识</strong>：第一课（VFS 四对象）、第二课（open() 路径 + dcache）<br>
+  <strong>预估时间</strong>：35–45 分钟
+</div>
+
+<h2>从 open() 到 read()</h2>
+
+<p>第二课我们跟完了 <code>open()</code> 的九步旅程——拿到了 fd，建立了完整的引用链。但 open 只是敲门，<strong>真正干活的是 read()</strong>。</p>
+
+<blockquote>
+  <code>read(fd, buf, 4096)</code>——用户的 4096 字节数据，从哪里来？<br>
+  答案：从 <strong>Page Cache（页缓存）</strong>来。如果缓存有，直接复制到用户空间；如果缓存没有，才从磁盘读。
+</blockquote>
+
+<p>Page Cache 是 Linux 文件系统性能的<strong>绝对基石</strong>。可以这么讲：<strong>没有 page cache，文件系统性能会慢 1000 倍以上</strong>。</p>
+
+<h2>1. Page Cache 是什么？</h2>
+
+<div class="layer-box">
+  <h4>📦 定义</h4>
+  <p>Page Cache 是内核用<strong>物理内存页面</strong>来缓存磁盘文件数据的机制。每个缓存页的大小等于系统页面大小（通常是 4KB）。</p>
+  <p>当你 <code>read()</code> 一个文件时：</p>
+  <ul>
+    <li>如果数据已经在 page cache 中 → <strong>直接从内存复制到用户缓冲区</strong>（纳秒级）</li>
+    <li>如果数据不在 page cache 中 → 从磁盘读到 page cache，<strong>再复制到用户缓冲区</strong>（毫秒级）</li>
+  </ul>
+</div>
+
+<h3>1.1 核心数据结构：address_space</h3>
+
+<p>每个 inode 都有一个 <code>i_mapping</code> 指针，指向它的 <code>struct address_space</code>——这是连接 inode 和 page cache 的桥梁。</p>
+
+<pre style="font-size:0.8rem;">
+// include/linux/fs.h
+struct inode {
+    // ...
+    struct address_space    *i_mapping;     // ← page cache 的入口
+    struct address_space    i_data;          // ← 内嵌的 address_space（大部分文件用这个）
+    // ...
+};
+
+struct address_space {
+    struct inode            *host;           // 指向所属的 inode（反向关联）
+    struct xarray           i_pages;        // ★ 存储所有缓存页的数据结构（xarray）
+    struct address_space_operations *a_ops;  // 操作函数表
+    struct rb_root_cached   i_mmap;         // 共享映射（mmap 用）
+    atomic_t                i_mmap_writable; // 可写共享映射计数
+    unsigned long           nrpages;        // 当前缓存的页面数量
+    // ...
+};
+```
+
+<p>一个文件被 read 时，它的数据页就这样被组织起来：</p>
+
+<div class="figure">
+<svg viewBox="0 0 680 160" width="680" height="160" style="max-width:100%;height:auto;">
+  <!-- inode -->
+  <rect x="20" y="10" width="130" height="60" rx="6" fill="#e3f2e0" stroke="#337733" stroke-width="1.5"/>
+  <text x="85" y="32" text-anchor="middle" font-size="11" font-weight="500">struct inode</text>
+  <text x="85" y="50" text-anchor="middle" font-size="10">i_size = 16384</text>
+  <text x="85" y="64" text-anchor="middle" font-size="10">i_nlink = 1</text>
+
+  <line x1="150" y1="40" x2="200" y2="40" stroke="#6b6760" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="175" y="32" font-size="9" fill="#666">i_mapping</text>
+
+  <!-- address_space -->
+  <rect x="200" y="10" width="150" height="60" rx="6" fill="#fff8e6" stroke="#d4a017" stroke-width="1.5"/>
+  <text x="275" y="32" text-anchor="middle" font-size="11" font-weight="500">struct address_space</text>
+  <text x="275" y="50" text-anchor="middle" font-size="10">nrpages = 4</text>
+  <text x="275" y="64" text-anchor="middle" font-size="10">a_ops = ext4_aops</text>
+
+  <line x1="350" y1="40" x2="400" y2="40" stroke="#6b6760" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="375" y="32" font-size="9" fill="#666">i_pages (xarray)</text>
+
+  <!-- page cache 中的页 -->
+  <rect x="400" y="10" width="50" height="50" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="425" y="30" text-anchor="middle" font-size="9">页 0</text>
+  <text x="425" y="48" text-anchor="middle" font-size="8">offset=0</text>
+
+  <rect x="455" y="10" width="50" height="50" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="480" y="30" text-anchor="middle" font-size="9">页 1</text>
+  <text x="480" y="48" text-anchor="middle" font-size="8">offset=4096</text>
+
+  <rect x="510" y="10" width="50" height="50" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="535" y="30" text-anchor="middle" font-size="9">页 2</text>
+  <text x="535" y="48" text-anchor="middle" font-size="8">offset=8192</text>
+
+  <rect x="565" y="10" width="50" height="50" rx="4" fill="#fce8e6" stroke="#c62828" stroke-width="1"/>
+  <text x="590" y="30" text-anchor="middle" font-size="9">页 3</text>
+  <text x="590" y="48" text-anchor="middle" font-size="8">offset=12288</text>
+
+  <!-- 图例 -->
+  <rect x="400" y="75" width="16" height="16" rx="2" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="0.8"/>
+  <text x="422" y="87" font-size="9" fill="#666">干净页（已同步磁盘）</text>
+  <rect x="565" y="75" width="16" height="16" rx="2" fill="#fce8e6" stroke="#c62828" stroke-width="0.8"/>
+  <text x="587" y="87" font-size="9" fill="#666">脏页（待写回）</text>
+
+  <defs>
+    <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6" fill="#6b6760"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>一个 16KB 的文件的 page cache 状态。4 页已缓存，第 3 页是脏页。xarray 维护了"偏移 → 页"的映射。</figcaption>
+</div>
+
+<h3>1.2 xarray：page cache 的索引结构</h3>
+
+<p>以前叫 <strong>radix tree</strong>，在较新内核中改为 <strong>xarray</strong>（本质上还是基树，但 API 更简洁）。它解决的问题是：<strong>给定文件偏移量（0, 4096, 8192...），快速找到对应的缓存页。</strong></p>
+
+<p>一个 16 KB 文件（4 页）的 xarray：</p>
+
+<div class="figure">
+<svg viewBox="0 0 620 120" width="620" height="120" style="max-width:100%;height:auto;">
+  <!-- 根节点 -->
+  <rect x="270" y="5" width="50" height="30" rx="4" fill="#e8dff5" stroke="#673ab7" stroke-width="1.5"/>
+  <text x="295" y="25" text-anchor="middle" font-size="11" font-weight="500">根</text>
+
+  <!-- 内部节点 -->
+  <rect x="140" y="50" width="50" height="30" rx="4" fill="#f0efe9" stroke="#6b6760" stroke-width="1"/>
+  <text x="165" y="73" text-anchor="middle" font-size="10" fill="#6b6760">slot 0</text>
+
+  <rect x="270" y="50" width="50" height="30" rx="4" fill="#f0efe9" stroke="#6b6760" stroke-width="1"/>
+  <text x="295" y="73" text-anchor="middle" font-size="10" fill="#6b6760">slot 1</text>
+
+  <rect x="400" y="50" width="50" height="30" rx="4" fill="#f0efe9" stroke="#6b6760" stroke-width="1"/>
+  <text x="425" y="73" text-anchor="middle" font-size="10" fill="#6b6760">slot 2</text>
+
+  <!-- 叶节点 = 页 -->
+  <rect x="40" y="90" width="50" height="30" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="65" y="112" text-anchor="middle" font-size="10">页[0:4095]</text>
+
+  <rect x="130" y="90" width="50" height="30" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="155" y="112" text-anchor="middle" font-size="10">页[4096:8191]</text>
+
+  <!-- 连线 -->
+  <line x1="295" y1="35" x2="165" y2="50" stroke="#6b6760" stroke-width="1"/>
+  <line x1="295" y1="35" x2="295" y2="50" stroke="#6b6760" stroke-width="1"/>
+  <line x1="295" y1="35" x2="425" y2="50" stroke="#6b6760" stroke-width="1"/>
+  <line x1="165" y1="80" x2="65" y2="90" stroke="#6b6760" stroke-width="1"/>
+  <line x1="165" y1="80" x2="155" y2="90" stroke="#6b6760" stroke-width="1"/>
+</svg>
+<figcaption>三层的基树索引。读取 offset=0 的数据时，从根 → slot 0 → 页[0]，O(1) 时间。</figcaption>
+</div>
+
+<pre style="font-size:0.8rem;">
+// xarray 查找的核心操作
+// 给定文件偏移 → 找到对应的 page cache 页
+struct page *pagecache_get_page(struct address_space *mapping,
+                                pgoff_t index,    // 页索引 = offset >> PAGE_SHIFT
+                                int fgp_flags,    // 查找标志
+                                gfp_t gfp_mask)
+{
+    // 在 xarray 中查找
+    page = xa_load(&mapping->i_pages, index);
+    if (page)
+        return page;
+
+    // 如果找不到且要求分配 → 新建页并插入 xarray
+    page = __page_cache_alloc(gfp_mask);
+    xa_store(&mapping->i_pages, index, page, gfp_mask);
+    return page;
+}
+</pre>
+
+<p>性能关键：<strong>xa_load() 是 O(1) 的</strong>——基数树的高度固定（对于 4KB 页、64 位系统，树高 ≈ 6 层就覆盖了整个文件系统的 64 位地址空间）。</p>
+
+<h2>2. read() 的完整旅程（七步）</h2>
+
+<p>假设我们已经 <code>open()</code> 拿到了 fd=3，现在调用 <code>read(3, buf, 4096)</code>：</p>
+
+<div class="step-flow">
+
+<div class="step">
+  <strong>第 1 步：libc 封装 → syscall</strong>
+  <p>与 open 类似，libc 的 <code>read()</code> 包装函数将 fd、buf、count 存入寄存器（<code>rdi=3, rsi=buf, rdx=4096</code>），执行 <code>syscall</code>，切换到内核态。</p>
+  <p 只要 "src">glibc/sysdeps/unix/sysv/linux/read.c</p>
+</div>
+
+<div class="step">
+  <strong>第 2 步：syscall 入口 → vfs_read()</strong>
+  <p>系统调用号 0（<code>__NR_read</code>），从 <code>sys_call_table</code> 找到 <code>ksys_read()</code>。它根据 fd=3 从进程的 fdtable 中找到对应的 <code>struct file</code>，然后调用 VFS 层的统一入口 <code>vfs_read()</code>。</p>
+  <p class="src">fs/read_write.c — <code>ksys_read()</code> → <code>vfs_read()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 3 步：VFS 层分发 → file-&gt;f_op-&gt;read_iter()</strong>
+  <p><code>vfs_read()</code> 做两件事：</p>
+  <ul>
+    <li>检查权限（file 的 f_mode 是否可读）</li>
+    <li>调用 <code>file-&gt;f_op->read_iter()</code></li>
+  </ul>
+  <p>对于 ext4 普通文件，这个函数指针是 <code>ext4_file_read_iter()</code>。但对于 procfs 里的文件，这里的函数就完全不同了。</p>
+  <p class="src">fs/read_write.c — <code>vfs_read()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 4 步：通用文件读取 → generic_file_read_iter()</strong>
+  <p>ext4 的 read_iter 调用 <strong>通用文件读取函数</strong> <code>generic_file_read_iter()</code>。这是 page cache 的核心入口。</p>
+  <p class="src">mm/filemap.c — <code>generic_file_read_iter()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 5 步：filemap_read() — page cache 查找 (最核心)</strong>
+  <p>这是决定性的一步。<code>filemap_read()</code> 的核心逻辑：</p>
+
+  <pre style="font-size:0.8rem;">
+// mm/filemap.c — filemap_read() 核心循环（极度简化）
+ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+                     ssize_t already_read)
+{
+    struct address_space *mapping = file->f_mapping;
+    pgoff_t index = iocb->ki_pos >> PAGE_SHIFT;  // offset → 页索引
+
+    do {
+        // ① 在 page cache 中找这一页
+        folio = filemap_get_folio(mapping, index);
+
+        if (IS_ERR(folio)) {
+            // ② 没命中！从磁盘读
+            //    ★ filemap_readahead() — 发起预读（一次可能读多页）
+            //    ★ mapping->a_ops->read_folio() — 读一页
+            //    → 磁盘 I/O → 磁盘数据到内存页
+            //    → 页现在在 page cache 中了
+        }
+
+        // ③ 把页中的数据复制到用户缓冲区
+        //    copy_page_to_iter() — 真正的数据传递
+        //    ↑ 这就是"read"最终做的事情
+
+        index++;  // 下一页
+    } while (还有数据要读);
+
+    return total_read;  // 返回实际读取的字节数
+}
+  </pre>
+
+  <p class="src">mm/filemap.c — <code>filemap_read()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 6 步：未命中时的磁盘 I/O 路径</strong>
+  <p>page cache 没命中的情况下，内核需要从磁盘读取数据。以 ext4 为例：</p>
+
+  <pre style="font-size:0.8rem;">
+// 预读（page_cache_sync_readahead()）判断需要读哪些页
+// → mapping->a_ops->read_folio()
+//   → ext4_read_folio()              (fs/ext4/inode.c)
+//     → __block_read_full_folio()    (fs/buffer.c)
+//       → 创建 bio（块 I/O 请求）
+//       → submit_bio()                (block/blk-core.c)
+//         → 通用块层
+//           → I/O 调度器（mq-deadline / BFQ）
+//             → 磁盘驱动程序
+//               → DMA 传输到 page cache 页
+//                 → 完成！数据在 page cache 中了
+//                   → 回到第 5 步的 copy_page_to_iter()
+  </pre>
+
+  <p class="src">fs/ext4/inode.c → fs/buffer.c → block/blk-core.c → 块层...</p>
+</div>
+
+<div class="step">
+  <strong>第 7 步：数据复制到用户态 → 返回</strong>
+  <p><code>copy_page_to_iter()</code> 将 page cache 页中的数据拷贝到用户空间的缓冲区 <code>buf</code>。如果命中缓存，这是整个 read() 中<strong>唯一的内存操作</strong>，没有磁盘 I/O。然后 <code>ki_pos += count</code>，返回实际读取的字节数。</p>
+  <p class="src">lib/iov_iter.c — <code>copy_page_to_iter()</code></p>
+</div>
+
+</div>
+
+<h3>read() 的两种路径对比</h3>
+
+<div class="figure">
+<svg viewBox="0 0 680 260" width="680" height="260" style="max-width:100%;height:auto;">
+  <!-- 左列：缓存命中 -->
+  <rect x="30" y="10" width="300" height="240" rx="8" fill="#e3f2e0" stroke="#337733" stroke-width="1.5"/>
+  <text x="180" y="30" text-anchor="middle" font-size="12" font-weight="500" fill="#337733">✅ 缓存命中路径（常见）</text>
+  <text x="45" y="55" font-size="10">read() → vfs_read() → filemap_read()</text>
+  <text x="45" y="75" font-size="10">  → filemap_get_folio() → xa_load() ✅</text>
+  <text x="45" y="95" font-size="10">  → copy_page_to_iter()</text>
+  <text x="45" y="115" font-size="10">  → 返回数据</text>
+  <line x1="50" y1="135" x2="310" y2="135" stroke="#337733" stroke-width="0.5" stroke-dasharray="3,3"/>
+  <text x="55" y="155" font-size="10" font-weight="500">只需要：</text>
+  <text x="55" y="175" font-size="10">1. 从 xarray 查一次（内存操作）</text>
+  <text x="55" y="195" font-size="10">2. memcpy 一次（页 → 用户缓冲区）</text>
+  <text x="55" y="220" font-size="10" fill="#337733" font-weight="500">总时间：~100ns（纳秒级）</text>
+
+  <!-- 右列：缓存未命中 -->
+  <rect x="350" y="10" width="300" height="240" rx="8" fill="#fce8e6" stroke="#c62828" stroke-width="1.5"/>
+  <text x="500" y="30" text-anchor="middle" font-size="12" font-weight="500" fill="#c62828">❌ 缓存未命中路径（罕见）</text>
+  <text x="365" y="55" font-size="10">read() → vfs_read() → filemap_read()</text>
+  <text x="365" y="75" font-size="10">  → filemap_get_folio() → xa_load() ❌</text>
+  <text x="365" y="95" font-size="10">  → 分配新页框 → 插入 xarray</text>
+  <text x="365" y="115" font-size="10">  → ext4_read_folio() → 创建 bio</text>
+  <text x="365" y="135" font-size="10">  → submit_bio() → I/O 调度器</text>
+  <text x="365" y="155" font-size="10">  → 磁盘 DMA → 页填满数据</text>
+  <text x="365" y="175" font-size="10">  → copy_page_to_iter()</text>
+  <text x="365" y="195" font-size="10">  → 返回数据</text>
+  <text x="365" y="220" font-size="10" fill="#c62828" font-weight="500">总时间：~1-10ms（毫秒级！）</text>
+</svg>
+<figcaption>缓存命中和未命中的路径对比。命中时不碰磁盘——差了 4–5 个数量级。</figcaption>
+</div>
+
+<h2>3. 预读（Readahead）——让大部分 read() 命中的关键</h2>
+
+<p>如果每次 read() 都等缺页才触发 I/O，性能还是不够。因为 <strong>read() 通常是顺序访问的</strong>。</p>
+
+<p>内核的读优化策略：<strong>预读（readahead）</strong>——当你读第 0 页时，内核推测你会读第 1、2、3 页，提前把它们也从磁盘读到 page cache 中。</p>
+
+<pre style="font-size:0.8rem;">
+// mm/readahead.c — 预读逻辑的核心决策
+void page_cache_sync_readahead(struct address_space *mapping,
+                               struct file_ra_state *ra,
+                               struct file *file,
+                               pgoff_t index)
+{
+    // 判断是否为顺序访问
+    if (index == ra->start + ra->size) {
+        // ★ 顺序访问 → 增大预读窗口
+        //    典型的预读大小递增：
+        //    第 1 次 → 4 页（16KB）
+        //    第 2 次 → 8 页（32KB）
+        //    第 3 次 → 16 页（64KB）
+        //    ……直到上限（通常 128KB~2MB）
+        ra->size = min(ra->size * 2, ra->ra_pages);
+    } else {
+        // 随机访问 → 保守，只读需要的页
+        ra->size = 0;
+    }
+
+    // 发起预读 I/O
+    read_pages(mapping, file, &page_list, ra->size);
+}
+</pre>
+
+<div class="figure">
+<svg viewBox="0 0 660 160" width="660" height="160" style="max-width:100%;height:auto;">
+  <text x="20" y="18" font-size="11" font-weight="500">预读效果示意图  read(3, buf, 4096) 第三次调用时：</text>
+
+  <rect x="20" y="35" width="620" height="30" rx="3" fill="#f5f5f5" stroke="#ccc" stroke-width="0.8"/>
+  <text x="40" y="55" font-size="9">文件偏移</text>
+  <text x="330" y="55" text-anchor="middle" font-size="9">…… 可能尚未读取的数据 ……</text>
+
+  <!-- 已读区域 -->
+  <rect x="40" y="75" width="70" height="30" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="75" y="95" text-anchor="middle" font-size="9">[0, 4KB]</text>
+  <text x="75" y="108" text-anchor="middle" font-size="7" fill="#666">read() 请求</text>
+
+  <!-- 预读区域 -->
+  <rect x="110" y="75" width="70" height="30" rx="3" fill="#e8dff5" stroke="#673ab7" stroke-width="1"/>
+  <text x="145" y="95" text-anchor="middle" font-size="9">[4K, 8K)</text>
+  <text x="145" y="108" text-anchor="middle" font-size="7" fill="#673ab7">预读</text>
+
+  <rect x="180" y="75" width="70" height="30" rx="3" fill="#e8dff5" stroke="#673ab7" stroke-width="1"/>
+  <text x="215" y="95" text-anchor="middle" font-size="9">[8K, 12K)</text>
+  <text x="215" y="108" text-anchor="middle" font-size="7" fill="#673ab7">预读</text>
+
+  <rect x="250" y="75" width="70" height="30" rx="3" fill="#e8dff5" stroke="#673ab7" stroke-width="1"/>
+  <text x="285" y="95" text-anchor="middle" font-size="9">[12K, 16K)</text>
+
+  <!-- 下一次 read 请求 -->
+  <rect x="110" y="130" width="70" height="25" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="0.8" stroke-dasharray="3,3"/>
+  <text x="145" y="147" text-anchor="middle" font-size="8" fill="#2e6b9e">下次 read()</text>
+
+  <text x="370" y="90" font-size="10">→ 下一次 read(3, buf, 4096) 时</text>
+  <text x="370" y="108" font-size="10">   f_pos = 4096，请求页索引 1</text>
+  <text x="370" y="126" font-size="10">   filemap_get_folio() → 命中！✅</text>
+  <text x="370" y="144" font-size="10" fill="#337733" font-weight="500">   零 I/O，直接 memcpy 返回</text>
+</svg>
+<figcaption>预读让"下一次 read() 的请求数据"提前就在 page cache 中了，用户感知不到延迟。</figcaption>
+</div>
+
+<div class="insight">
+  <strong>💡 预读的赌注</strong>：内核赌你对文件是顺序读的。事实是绝大多数场景确实是顺序读（<code>cat</code>、日志处理、数据拷贝、流媒体播放）。赌对了性能大赚；赌错了（随机访问）浪费一次 I/O 带宽但不会出错——读到 page cache 的页最多被 LRU 回收掉。
+</div>
+
+<h2>4. 脏页与回写（Writeback）</h2>
+
+<p>write() 的路径和 read() 对称——数据先写入 page cache，标记页为"脏"（dirty），然后内核异步写回磁盘。</p>
+
+<pre style="font-size:0.8rem;">
+// write() 的核心简化流程
+write(fd, buf, 4096)
+  → vfs_write()
+    → file->f_op->write_iter()
+      → generic_perform_write()
+        → iov_iter_copy_from_user_atomic()  // 从用户空间拷贝到 page cache
+        → mark_buffer_dirty()               // 标记为脏页
+        → 返回（数据还在内存，还没到磁盘！）
+
+// 脏页回写（内核异步，由 flusher 线程执行）
+// 触发条件：
+//   1. 脏页比例超过 /proc/sys/vm/dirty_background_ratio（默认 10%）
+//   2. 脏页存在时间超过 /proc/sys/vm/dirty_expire_centisecs（默认 30 秒）
+//   3. 调用 fsync() / sync() 同步强制回写
+</pre>
+
+<h3>文件 I/O 的完整视角：read 和 write 共享同一套 page cache</h3>
+
+<div class="figure">
+<svg viewBox="0 0 640 150" width="640" height="150" style="max-width:100%;height:auto;">
+  <!-- 用户空间 -->
+  <rect x="20" y="10" width="600" height="28" rx="5" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="320" y="29" text-anchor="middle" font-size="11">用户空间：进程 A（buf） / 进程 B（buf）</text>
+
+  <!-- 箭头 -->
+  <line x1="320" y1="38" x2="320" y2="55" stroke="#c62828" stroke-width="1.2" marker-end="url(#ar3)"/>
+  <text x="340" y="50" font-size="9" fill="#c62828">write() 拷贝</text>
+  <line x1="320" y1="95" x2="320" y2="65" stroke="#2e6b9e" stroke-width="1.2" marker-end="url(#ar3up)"/>
+  <text x="340" y="85" font-size="9" fill="#2e6b9e">read() 拷贝</text>
+
+  <!-- Page Cache -->
+  <rect x="20" y="60" width="600" height="28" rx="5" fill="#fff8e6" stroke="#d4a017" stroke-width="2"/>
+  <text x="320" y="79" text-anchor="middle" font-size="11" font-weight="500">Page Cache（内核内存）</text>
+
+  <!-- 磁盘 -->
+  <line x1="320" y1="88" x2="320" y2="110" stroke="#6b6760" stroke-width="1.2" marker-end="url(#ar3)"/>
+  <text x="340" y="107" font-size="9" fill="#6b6760">回写 / 预读 · 磁盘 I/O</text>
+  <rect x="20" y="115" width="600" height="28" rx="5" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2"/>
+  <text x="320" y="134" text-anchor="middle" font-size="11">磁盘（HDD / SSD）</text>
+
+  <defs>
+    <marker id="ar3" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6" fill="#6b6760"/>
+    </marker>
+    <marker id="ar3up" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M6,0 L0,3 L6,6" fill="#6b6760"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>read() 和 write() 共享同一套 page cache。write() 写到 page cache 就返回，内核异步回写磁盘。read() 从 page cache 读，未命中才走磁盘。</figcaption>
+</div>
+
+<h2>5. 知识测验</h2>
+
+<div class="quiz" id="quiz1">
+  <div class="quiz-question">1️⃣ 执行 read(fd, buf, 4096) 时，以下哪个操作一定发生？</div>
+  <button class="quiz-option" onclick="cq(this,'wrong')">A. 磁盘 I/O</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">B. 分配新的物理页框</button>
+  <button class="quiz-option" onclick="cq(this,'correct')">C. copy_page_to_iter() 将数据复制到用户缓冲区</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">D. ext4_read_folio() 被调用</button>
+  <div class="quiz-feedback" id="quiz1-fb">
+    <strong>正确答案：C</strong><br>
+    read() 无论如何都要把数据从 page cache 复制到用户缓冲区。如果缓存命中，A 和 D 都不会发生；B 只在缓存未命中且需要新页时发生。只有 C 是 read() 的必经之路。
+  </div>
+</div>
+
+<div class="quiz" id="quiz2">
+  <div class="quiz-question">2️⃣ 预读（readahead）在什么情况下会"自动紧缩"？</div>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">A. 磁盘空间不足</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">B. 内核检测到文件大小不变时</button>
+  <button class="quiz-option" onclick="cq2(this,'correct')">C. 访问模式从顺序变为随机时</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">D. 内存不足时</button>
+  <div class="quiz-feedback" id="quiz2-fb">
+    <strong>正确答案：C</strong><br>
+    预读的"赌注"是顺序访问。如果内核发现 read() 请求的页不在预读窗口内（比如 <code>ra-&gt;start + ra-&gt;size</code> 不等于当前 index），就判定为随机访问，将预读大小降为 0，不再浪费 I/O。
+  </div>
+</div>
+
+<div class="quiz" id="quiz3">
+  <div class="quiz-question">3️⃣ write() 调用返回后，数据一定在磁盘上了吗？</div>
+  <button class="quiz-option" onclick="cq3(this,'correct')">A. 不一定，数据可能在 page cache 中，尚未回写</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">B. 一定在，write() 返回即保证持久化</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">C. 一定不在，需要调用 fsync()</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">D. 取决于文件大小</button>
+  <div class="quiz-feedback" id="quiz3-fb">
+    <strong>正确答案：A</strong><br>
+    write() 的默认行为是"写回缓存（write-back）"——数据写入 page cache 就返回，标记为脏页。内核后台线程（flusher）异步回写。如果需要确保数据在磁盘上，必须调用 fsync()。这也解释了为什么机器突然断电会丢数据——page cache 中的脏页还没写回磁盘。选项 C "一定不在" 过于绝对。
+  </div>
+</div>
+
+<div class="quiz" id="quiz4">
+  <div class="quiz-question">4️⃣ 两个进程分别打开同一个文件并执行 read()，它们各自读到的数据来自于同一个物理内存页吗？</div>
+  <button class="quiz-option" onclick="cq4(this,'correct')">A. 是的，因为共享同一个 page cache</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">B. 不是，每个进程有独立的缓冲区</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">C. 取决于谁先读</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">D. 只在使用 mmap 时才共享</button>
+  <div class="quiz-feedback" id="quiz4-fb">
+    <strong>正确答案：A</strong><br>
+    page cache 是全局共享的。两个进程的 <code>struct file</code> 不同，但它们指向同一个 inode → 同一个 address_space → 同一个 page cache。read() 时各自调用 copy_page_to_iter() 把同一页的数据复制到各自的用户缓冲区。这也意味着：进程 A 先读触发磁盘 I/O 将数据读入 page cache，进程 B 后读直接从 page cache 命中——零 I/O。
+  </div>
+</div>
+
+<h2>6. 小结与下一步</h2>
+
+<p>本课你学到了：</p>
+<ul>
+  <li>✅ Page Cache 是文件读写的核心——所有文件 I/O 都经过它</li>
+  <li>✅ address_space 通过 xarray（基树）组织缓存页：给定偏移 → O(1) 找页</li>
+  <li>✅ read() 的七步旅程：vfs_read → filemap_read → page cache 查找 → 命中则 memcpy，未命中则磁盘 I/O</li>
+  <li>✅ 预读机制：内核赌你顺序读，提前加载后续页到 cache</li>
+  <li>✅ 脏页与异步回写：write() 写到 cache 就返回，flusher 线程异步写磁盘</li>
+  <li>✅ 命中 vs 未命中差了 4–5 个数量级（~100ns vs ~1-10ms）</li>
+</ul>
+
+<p>接下来：</p>
+<ul>
+  <li><strong>第四课</strong>：ext4 磁盘数据结构——块组、inode 表、extent 树、延迟分配</li>
+  <li><strong>第五课</strong>：procfs 与虚拟文件系统的设计思想</li>
+</ul>
+
+<blockquote>
+  <strong>📮 有疑问？</strong> 直接问我！page cache 是面试最高频的话题之一——可以展开讲预读算法细节、writeback 的控制参数、或者 cgroup writeback 的 IO 隔离机制。<br><br>
+  <strong>📚 推荐资料</strong>：
+  <em>Linux Kernel Development</em> (Robert Love) 第 15–16 章；
+  <a href="https://lwn.net/Articles/712467/" target="_blank">LWN: Page cache: the view from the inside</a>；
+  <a href="https://docs.kernel.org/filesystems/vfs.html" target="_blank">内核 VFS 文档</a>
+</blockquote>
+
+<script>
+function cq(btn, result) {
+  const p = btn.parentElement;
+  const fb = p.querySelector('.quiz-feedback');
+  p.querySelectorAll('.quiz-option').forEach(b => { b.classList.remove('selected','correct','wrong'); });
+  btn.classList.add('selected', result);
+  fb.classList.add('show');
+  fb.className = 'quiz-feedback show ' + result;
+}
+function cq2(btn, result) { cq(btn, result); }
+function cq3(btn, result) { cq(btn, result); }
+function cq4(btn, result) { cq(btn, result); }
+</script>
+
+</body>
+</html>

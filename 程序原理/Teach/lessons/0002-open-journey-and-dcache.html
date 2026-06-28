@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第二课：open() 的完整旅程与 dcache 深度解析</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+<style>
+  /* ===== Step flow ===== */
+  .step-flow { counter-reset: step; margin: 1.5em 0; }
+  .step {
+    counter-increment: step;
+    margin: 1em 0;
+    padding: 0.8rem 1rem 0.8rem 3.2rem;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    position: relative;
+    box-shadow: 0 1px 3px var(--shadow);
+  }
+  .step::before {
+    content: counter(step);
+    position: absolute;
+    left: 0.6rem;
+    top: 0.8rem;
+    width: 1.8rem; height: 1.8rem;
+    background: var(--accent);
+    color: white;
+    font-weight: 500;
+    font-size: 0.85rem;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step .src {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--muted);
+    display: block;
+    margin-top: 0.3rem;
+  }
+
+  /* ===== Code annotation ===== */
+  .hl { background: #fff8e6; padding: 0 0.2em; border-radius: 2px; }
+
+  /* ===== Two-column comparison ===== */
+  .compare {
+    display: flex; gap: 1rem; margin: 1em 0;
+  }
+  .compare > div {
+    flex: 1;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .compare h4 { margin-top: 0; }
+
+  /* ===== Lifecycle diagram ===== */
+  .timeline {
+    display: flex; flex-direction: column; gap: 0.5rem;
+    margin: 1.5em 0;
+    padding-left: 2rem;
+    border-left: 3px solid var(--accent);
+  }
+  .timeline-item {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 1rem;
+    position: relative;
+  }
+  .timeline-item .tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-family: var(--mono);
+    padding: 0.1em 0.5em;
+    border-radius: 3px;
+    color: white;
+    margin-right: 0.5em;
+  }
+  .tag-green { background: #337733; }
+  .tag-orange { background: #e65100; }
+  .tag-red { background: #c62828; }
+  .tag-blue { background: #2e6b9e; }
+  .tag-gray { background: #6b6760; }
+
+  /* ===== Hash table visualization ===== */
+  .hashtable { margin: 1em 0; }
+  .hash-row {
+    display: flex; align-items: center; margin-bottom: 0.3rem;
+    gap: 0.3rem;
+  }
+  .hash-bucket {
+    min-width: 80px; padding: 0.3rem 0.6rem;
+    background: #e1eaf3; border-radius: 4px;
+    font-family: var(--mono); font-size: 0.8rem;
+    text-align: center;
+  }
+  .hash-chain {
+    display: flex; gap: 0.2rem; flex-wrap: wrap;
+  }
+  .hash-entry {
+    padding: 0.3rem 0.6rem;
+    background: white; border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono); font-size: 0.78rem;
+  }
+
+  @media (max-width: 600px) {
+    .compare { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+
+<h1>🔍 第二课：open() 的完整旅程与 dcache 深度解析</h1>
+
+<div class="lesson-meta">
+  <strong>主题</strong>：open() 系统调用的逐层深入 + dcache 设计与正确性担保<br>
+  <strong>前置知识</strong>：第一课 — VFS 四个核心对象；基本了解系统调用和内存管理<br>
+  <strong>预估时间</strong>：35–45 分钟
+</div>
+
+<h2>从第一课结束的地方开始</h2>
+
+<p>第一课我们认识了 VFS 的四大对象：<strong>超级块</strong>、<strong>inode</strong>、<strong>dentry</strong>、<strong>file</strong>，以及它们之间的基本关系。</p>
+
+<p>但当时留下的问题是：<strong>一次 <code>open()</code> 从用户态到磁盘，到底经过了哪些步骤？dcache 在其中究竟做了什么？</strong></p>
+
+<p>这就是本课要回答的。</p>
+
+<h2>1. open("doc.txt", O_RDONLY) — 九步全景</h2>
+
+<p>下面的九步从用户态出发，经过系统调用入口、VFS 通用层、具体文件系统，直达磁盘。每一步都标注了内核源码的对应文件路径。</p>
+
+<div class="step-flow">
+
+<div class="step">
+  <strong>第 1 步：glibc 包装（用户态 → 陷入内核）</strong>
+  <p>用户程序调用 <code>open("doc.txt", O_RDONLY)</code>，实际上是调用 glibc 中的包装函数。包装函数将参数存入寄存器（x86‑64：<code>rdi=路径</code>，<code>rsi=flags</code>，<code>rdx=mode</code>），然后执行 <code>syscall</code> 指令，切换到内核态。</p>
+  <p class="src">glibc/sysdeps/unix/sysv/linux/openat.c</p>
+</div>
+
+<div class="step">
+  <strong>第 2 步：syscall 入口（架构相关）</strong>
+  <p>内核从 <code>MSR_LSTAR</code> 读取系统调用入口地址，进入 <code>entry_SYSCALL_64()</code>。保存寄存器，调用 <code>do_syscall_64()</code>。根据 <code>rax</code> 中的系统调用号（257 = <code>__NR_openat</code>），从 <code>sys_call_table</code> 找到对应的处理函数。</p>
+  <p class="src">arch/x86/entry/entry_64.S → arch/x86/entry/common.c</p>
+</div>
+
+<div class="step">
+  <strong>第 3 步：VFS 通用入口</strong>
+  <p><code>do_sys_open()</code> 是真正的 C 入口。它把用户态路径字符串拷贝到内核空间，然后调用 <code>do_filp_open()</code> 进行真正的文件打开工作。</p>
+  <p class="src">fs/open.c — <code>do_sys_open()</code> → <code>do_filp_open()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 4 步：路径解析（最复杂的一步）</strong>
+  <p><code>path_openat()</code> → <code>link_path_walk()</code>。这是整个 open() 中最核心也最复杂的部分。<strong>如果路径有 N 个分量，这一步就会重复 N 次</strong>（见第 4a–4e 子步骤）。</p>
+  <p>以 <code>/home/user/doc.txt</code> 为例，内核会依次解析 <code>/</code> → <code>home</code> → <code>user</code> → <code>doc.txt</code>。</p>
+  <p class="highlight-src" style="text-align:right;font-size:0.85rem;color:var(--muted);">fs/namei.c — 路径解析的核心代码都在这个文件中</p>
+</div>
+
+<details open style="margin:0.5em 0 1em 2rem;border-left:2px solid var(--border);padding-left:1rem;">
+<summary style="cursor:pointer;font-weight:500;color:var(--accent);">🔽 展开第 4 步的 5 个子步骤</summary>
+
+<div class="step-flow" style="margin:0.5em 0 0;">
+
+<div class="step">
+  <strong>4a. 获取起始点</strong>
+  <p>从当前进程的 <code>fs->pwd</code>（当前工作目录）拿到起始 dentry。如果是绝对路径（以 <code>/</code> 开头），则从 <code>current->fs->root</code> 拿到根 dentry。根目录的 dentry <strong>永远不会被 dcache 换出</strong>。</p>
+</div>
+
+<div class="step">
+  <strong>4b. dcache 查找（<code>lookup_fast()</code>）</strong>
+  <p>先在 dcache 中查找当前路径分量的 dentry。dcache 的内部结构是 <strong>哈希表</strong>（不是树），哈希键是 <code>(父 dentry 指针 + 分量名字符串 hash)</code>。</p>
+  <p>如果命中 → 直接拿到 dentry → 拿到 inode → 零次磁盘 I/O。如果未命中 → 走下一步。</p>
+  <p class="src">fs/namei.c — <code>lookup_fast()</code> → <code>__d_lookup_rcu()</code></p>
+</div>
+
+<div class="step">
+  <strong>4c. dcache 未命中 → 磁盘 I/O（<code>lookup_slow()</code>）</strong>
+  <p>VFS 调用父目录 inode 的 <code>i_op->lookup()</code>。对于 ext4：</p>
+  <ol style="margin-top:0.3em;">
+    <li>读取父目录文件的数据块（磁盘 I/O）</li>
+    <li>在目录项列表中搜索当前分量名</li>
+    <li>找到后拿到目标 inode 号</li>
+    <li><code>ext4_iget()</code> 从磁盘 inode 表读取 inode 数据（磁盘 I/O）</li>
+    <li>用 <code>d_add()</code> 创建新 dentry，挂入 dcache 哈希表</li>
+  </ol>
+  <p class="src">fs/ext4/namei.c — <code>ext4_lookup()</code> → <code>ext4_iget()</code> (fs/ext4/inode.c)</p>
+</div>
+
+<div class="step">
+  <strong>4d. 检查软链接</strong>
+  <p>如果查到的 inode 类型是 <code>S_IFLNK</code>（软链接），则调用 <code>pick_link()</code> → <code>i_op->follow_link()</code>，读取软链接的内容作为新路径，<strong>回到步骤 4a 重新解析</strong>。</p>
+  <p>这就是软链接可以"跨文件系统"的根本原因——它存的是路径字符串，每次使用时才重新 lookup。</p>
+</div>
+
+<div class="step">
+  <strong>4e. 返回最终 dentry</strong>
+  <p>所有分量解析完成后，返回目标文件/目录的 dentry 和 inode，封装在 <code>struct path</code> 中。</p>
+</div>
+
+</div>
+</details>
+
+<div class="step">
+  <strong>第 5 步：权限检查</strong>
+  <p><code>may_open()</code> → <code>inode_permission()</code>。检查进程的 uid/gid 是否匹配 inode 的 <code>i_uid</code>/<code>i_gid</code>，请求的读写模式是否与 <code>i_mode</code> 权限位冲突（包括 ACL、SELinux 等扩展权限检查）。</p>
+  <p class="src">fs/namei.c — <code>may_open()</code>；fs/posix_acl.c — ACL 检查</p>
+</div>
+
+<div class="step">
+  <strong>第 6 步：分配 file 对象</strong>
+  <p><code>alloc_empty_file()</code> 从 slab 分配器分配一个新的 <code>struct file</code>，初始化关键字段：</p>
+  <ul>
+    <li><code>f_path</code> = dentry + mount 信息</li>
+    <li><code>f_op</code> = inode 的 <code>i_fop</code>（默认文件操作函数表）</li>
+    <li><code>f_mode</code> = O_RDONLY</li>
+    <li><code>f_pos</code> = 0</li>
+  </ul>
+  <p class="src">fs/file_table.c — <code>alloc_empty_file()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 7 步：调用具体文件系统的 open()</strong>
+  <p><code>do_dentry_open()</code> → <code>f_op->open()</code>。大部分普通文件系统（ext4、XFS 等）的 open 方法为 <strong>NULL</strong>（不需要额外操作）。设备文件比较特殊——此步骤会替换 <code>f_op</code> 为设备驱动的 <code>file_operations</code>。</p>
+  <p class="src">fs/open.c — <code>do_dentry_open()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 8 步：分配文件描述符</strong>
+  <p><code>get_unused_fd_flags()</code> 在进程的 <code>fdtable</code> 中找到最小的未用 fd 编号（<code>current->files->fdt</code>），设置对应位图标志。</p>
+  <p class="src">fs/file.c — <code>get_unused_fd_flags()</code></p>
+</div>
+
+<div class="step">
+  <strong>第 9 步：关联 fd → file，返回</strong>
+  <p><code>fd_install(fd, file)</code> 将 file 指针写入 <code>current->files->fdt->fd[fd]</code>。返回 fd 编号给用户态。<strong>完成！</strong>用户拿到了一个整数 fd，背后是一条完整的引用链：</p>
+  <pre style="font-size:0.8rem;border-left-color:#337733;">
+  task_struct → files_struct → fdtable → fd[3] → file → dentry → inode → super_block
+  </pre>
+  <p class="src">fs/file.c — <code>fd_install()</code></p>
+</div>
+
+</div><!-- step-flow -->
+
+<h3>一次 open 的关键数据流（可视化）</h3>
+
+<div class="figure">
+<svg viewBox="0 0 720 280" width="720" height="280" style="max-width:100%;height:auto;">
+  <rect x="20" y="10" width="200" height="50" rx="6" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.5"/>
+  <text x="120" y="30" text-anchor="middle" font-size="11" font-weight="500">用户态 open("doc.txt")</text>
+  <text x="120" y="48" text-anchor="middle" font-size="10" fill="#666">→ 返回 fd = 3</text>
+
+  <line x1="220" y1="35" x2="270" y2="35" stroke="#6b6760" stroke-width="1.2" marker-end="url(#arrow2)"/>
+  <text x="245" y="27" font-size="9" fill="#999">syscall</text>
+
+  <rect x="270" y="10" width="120" height="50" rx="6" fill="#fff8e6" stroke="#d4a017" stroke-width="1.5"/>
+  <text x="330" y="30" text-anchor="middle" font-size="11" font-weight="500">VFS 通用层</text>
+  <text x="330" y="48" text-anchor="middle" font-size="10" fill="#666">path_openat()</text>
+
+  <line x1="390" y1="35" x2="440" y2="35" stroke="#6b6760" stroke-width="1.2" marker-end="url(#arrow2)"/>
+  <text x="415" y="27" font-size="9" fill="#999">i_op</text>
+
+  <rect x="440" y="10" width="120" height="50" rx="6" fill="#e3f2e0" stroke="#337733" stroke-width="1.5"/>
+  <text x="500" y="30" text-anchor="middle" font-size="11" font-weight="500">ext4 文件系统</text>
+  <text x="500" y="48" text-anchor="middle" font-size="10" fill="#666">ext4_lookup()</text>
+
+  <line x1="560" y1="35" x2="610" y2="35" stroke="#6b6760" stroke-width="1.2" marker-end="url(#arrow2)"/>
+  <text x="585" y="27" font-size="9" fill="#999">I/O</text>
+
+  <rect x="610" y="10" width="90" height="50" rx="6" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2"/>
+  <text x="655" y="30" text-anchor="middle" font-size="10">通用块层</text>
+  <text x="655" y="48" text-anchor="middle" font-size="10" fill="#666">→ 磁盘</text>
+
+  <!-- dcache 并行 -->
+  <rect x="80" y="90" width="140" height="36" rx="6" fill="#f0efe9" stroke="#6b6760" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="150" y="112" text-anchor="middle" font-size="10" fill="#666">dcache 哈希表</text>
+  <line x1="270" y1="35" x2="150" y2="90" stroke="#6b6760" stroke-width="0.8" stroke-dasharray="4,3"/>
+  <text x="200" y="75" font-size="9" fill="#999">lookup_fast()</text>
+
+  <!-- 进程 fdtable -->
+  <rect x="20" y="150" width="200" height="50" rx="6" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="120" y="170" text-anchor="middle" font-size="11">进程 fdtable</text>
+  <text x="120" y="188" text-anchor="middle" font-size="10" fill="#666">fd[3] → struct file</text>
+
+  <line x1="220" y1="175" x2="270" y2="175" stroke="#6b6760" stroke-width="1.2" marker-end="url(#arrow2)"/>
+  <text x="245" y="167" font-size="9" fill="#999">fd_install()</text>
+
+  <rect x="270" y="150" width="120" height="50" rx="6" fill="#fce8e6" stroke="#c62828" stroke-width="1.5"/>
+  <text x="330" y="170" text-anchor="middle" font-size="11" font-weight="500">struct file</text>
+  <text x="330" y="188" text-anchor="middle" font-size="10" fill="#666">f_pos=0, f_mode=O_RDONLY</text>
+
+  <line x1="390" y1="175" x2="440" y2="175" stroke="#6b6760" stroke-width="1.2" marker-end="url(#arrow2)"/>
+
+  <rect x="440" y="150" width="130" height="50" rx="6" fill="#fce8e6" stroke="#c62828" stroke-width="1.5"/>
+  <text x="505" y="170" text-anchor="middle" font-size="11" font-weight="500">struct dentry</text>
+  <text x="505" y="188" text-anchor="middle" font-size="10" fill="#666">d_name="doc.txt"</text>
+
+  <line x1="505" y1="200" x2="505" y2="230" stroke="#6b6760" stroke-width="1.2" marker-end="url(#arrow2)"/>
+
+  <rect x="440" y="230" width="130" height="40" rx="6" fill="#e3f2e0" stroke="#337733" stroke-width="1.5"/>
+  <text x="505" y="250" text-anchor="middle" font-size="11" font-weight="500">struct inode</text>
+  <text x="505" y="264" text-anchor="middle" font-size="10" fill="#666">i_nlink=1, i_size=4096</text>
+
+  <defs>
+    <marker id="arrow2" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6" fill="#6b6760"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>open() 的调用链叠加引用链。虚线箭头是 dcache 旁路（走缓存时的快速路径）。</figcaption>
+</div>
+
+<h2>2. dcache 深度解析</h2>
+
+<p>上一课介绍了 dentry 的基本概念。这里我们深入它的内部实现，回答你在学习中提出的那些问题。</p>
+
+<h3>2.1 dcache 的哈希表结构（不是树！）</h3>
+
+<p>dentry 在逻辑上构成了树（父子关系通过 <code>d_parent</code>、<code>d_subdirs</code> 指针维护），但 <strong>查找用的是哈希表</strong>，不是树遍历。</p>
+
+<pre style="font-size:0.8rem;">
+// 全局哈希表 — 32768 个桶
+#define D_HASH_BITS  15
+static struct hlist_bl_head dentry_hashtable[1 << D_HASH_BITS];
+
+// 哈希键的计算方式：
+// hash = hash(parent_dentry_pointer, d_name.string)
+// 注意：是全路径的每个分量独立哈希，不是整个人"/home/user/doc.txt"
+</pre>
+
+<div class="figure">
+<svg viewBox="0 0 680 160" width="680" height="160" style="max-width:100%;height:auto;">
+  <text x="20" y="20" font-size="11" font-weight="500">dentry_hashtable（全局 32768 个桶）</text>
+
+  <rect x="20" y="30" width="80" height="28" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="60" y="49" text-anchor="middle" font-size="9" fill="#2e6b9e">[0]</text>
+
+  <!-- 箭头到链表 -->
+  <line x1="100" y1="44" x2="115" y2="44" stroke="#6b6760" stroke-width="1" marker-end="url(#arrow3)"/>
+
+  <!-- 链表中的 dentry -->
+  <rect x="115" y="34" width="80" height="20" rx="3" fill="white" stroke="#c62828" stroke-width="1"/>
+  <text x="155" y="48" text-anchor="middle" font-size="8" fill="#c62828">dentry "home"</text>
+  <line x1="195" y1="44" x2="210" y2="44" stroke="#999" stroke-width="1"/>
+  <rect x="210" y="34" width="80" height="20" rx="3" fill="white" stroke="#c62828" stroke-width="1"/>
+  <text x="250" y="48" text-anchor="middle" font-size="8" fill="#c62828">dentry "etc"</text>
+  <line x1="290" y1="44" x2="305" y2="44" stroke="#999" stroke-width="1"/>
+  <rect x="305" y="34" width="100" height="20" rx="3" fill="white" stroke="#c62828" stroke-width="0.5"/>
+  <text x="355" y="48" text-anchor="middle" font-size="8" fill="#999">……</text>
+
+  <rect x="20" y="70" width="80" height="28" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="60" y="89" text-anchor="middle" font-size="9" fill="#2e6b9e">[1]</text>
+
+  <rect x="20" y="110" width="80" height="28" rx="3" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1"/>
+  <text x="60" y="129" text-anchor="middle" font-size="9" fill="#2e6b9e">[2]</text>
+  <line x1="100" y1="124" x2="115" y2="124" stroke="#6b6760" stroke-width="1" marker-end="url(#arrow3)"/>
+  <rect x="115" y="114" width="90" height="20" rx="3" fill="white" stroke="#337733" stroke-width="1"/>
+  <text x="160" y="128" text-anchor="middle" font-size="8" fill="#337733">dentry "usr"</text>
+  <text x="115" y="142" font-size="7" fill="#999">（父: dentry "/", hash("usr")）</text>
+
+  <rect x="20" y="75" width="600" height="6" fill="none" stroke-dasharray="2,2" stroke="#ccc"/>
+  <rect x="20" y="76" width="600" height="6" fill="none" stroke-dasharray="2,2" stroke="#ccc"/>
+
+  <text x="420" y="50" font-size="9" fill="#666">lookup_fast("home") 时：</text>
+  <text x="420" y="65" font-size="9" fill="#666">① 计算 hash("/") + hash("home")</text>
+  <text x="420" y="80" font-size="9" fill="#666">② 定位到 dentry_hashtable[hash]</text>
+  <text x="420" y="95" font-size="9" fill="#666">③ 遍历链表直到 d_parent→"/" 且 d_name="home"</text>
+
+  <defs>
+    <marker id="arrow3" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto">
+      <path d="M0,0 L5,2.5 L0,5" fill="#6b6760"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>dcache 的内部结构：哈希表 + 链表拉链。查找时用 <code>(parent_dentry + name_hash)</code> 直接定位桶，O(1) 命中。</figcaption>
+</div>
+
+<h3>2.2 查找过程：快速路径 vs 慢速路径</h3>
+
+<p><code>lookup_fast()</code> 使用 <strong>RCU（Read-Copy-Update）无锁读</strong>来尝试从 dcache 中获取 dentry。这是 dcache 的性能核心——大部分查找在 RCU 路径就能命中，不需要拿任何锁。</p>
+
+<pre style="font-size:0.8rem;">
+// fs/namei.c — lookup_fast() 简化逻辑
+struct dentry *lookup_fast(struct nameidata *nd)
+{
+    // 快速路径：RCU 无锁读
+    dentry = __d_lookup_rcu(parent, &nd->last, &nd->seq);
+    if (dentry)
+        goto success;
+
+    // 慢速路径：拿锁再查
+    dentry = __d_lookup(parent, &nd->last);
+    if (dentry)
+        goto success;
+
+    // 未命中 → 走磁盘 I/O
+    return NULL;
+
+success:
+    // 验证 inode 是否还在（有可能被 evict 了）
+    if (unlikely(!dentry->d_inode))
+        return NULL;
+    return dentry;
+}
+</pre>
+
+<p><strong>为什么用 RCU？</strong>因为路径解析是文件系统最高频的操作——每次 <code>open()</code>、<code>stat()</code>、<code>readdir()</code> 都会触发。如果每层都拿锁，多线程并发时锁竞争会剧烈拉低性能。RCU 允许读者在完全不拿锁的情况下读取 dcache，只有当检测到并发修改时才退回到锁保护路径。</p>
+
+<h3>2.3 负缓存（Negative Dentry）</h3>
+
+<p>当 <code>open()</code> 一个不存在的路径时，内核并不会"查过就算了"——它把"不存在"也缓存下来：</p>
+
+<pre style="font-size:0.8rem;">
+// dcache 中的"负 dentry"
+dentry "nonexistent"  →  d_inode = NULL
+                         d_flags  |= DCACHE_MISS_TYPE
+</pre>
+
+<p>下次再查同一个路径，<code>lookup_fast()</code> 看到 <code>d_inode == NULL</code>→ 直接返回 <code>-ENOENT</code>，完全不需要再走磁盘。</p>
+
+<div class="insight">
+  <strong>💡 为什么要缓存"不存在"？</strong>想象你编译程序时，<code>gcc</code> 会到多个 include 路径搜索头文件：<code>/usr/local/include/stdio.h</code> → 不存在 → <code>/usr/include/stdio.h</code> → 找到了。没有负缓存，每次编译都要读三四个目录的数据块来确认文件确实不存在。负缓存让这个开销降为零。
+</div>
+
+<p><strong>你问过的一个好问题：负缓存会被大量无用查询撑爆吗？</strong></p>
+<p>会。内核的应对：</p>
+<ol>
+  <li><strong>LRU 回收时优先回收负 dentry</strong>——代码在 <code>fs/dcache.c</code> 的 <code>dentry_lru_isolate()</code> 中对 <code>d_inode == NULL</code> 的 dentry 给予更高的回收优先级</li>
+  <li><strong>内存压力下</strong>缩水器（shrink_slab）会整体扫描 dcache 并驱逐最多最旧的条目</li>
+  <li>真实攻击案例：CVE-2018-5390 利用了大量畸形 TCP 包触发内核路径解析，产生大量负 dentry。后续内核增加了更激进的负 dentry 回收。</li>
+</ol>
+
+<h3>2.4 dentry 如何"钉住" inode（正确性担保）</h3>
+
+<p>这是你问过的最核心的问题：<strong>dentry 和 inode 是两个独立对象，怎么保证 dentry 存在时 inode 不会消失？</strong></p>
+
+<p>答案就在 <code>d_add()</code> 中：</p>
+
+<pre style="font-size:0.8rem;">
+// fs/dcache.c
+void d_add(struct dentry *dentry, struct inode *inode)
+{
+    dentry->d_inode = inode;          // dentry 指向 inode
+    if (inode) {
+        spin_lock(&inode->i_lock);
+        atomic_inc(&inode->i_count);  // ← 关键：inode 引用计数 +1！
+        spin_unlock(&inode->i_lock);
+    }
+    d_rehash(dentry);                 // 挂入哈希表，可被 lookup 命中
+}
+</pre>
+
+<p>所以担保链是：</p>
+<pre style="font-size:0.8rem;border-left-color:#337733;">
+dentry 在哈希表中  ⇒  dentry->d_inode != NULL  ⇒  inode->i_count >= 1  ⇒  inode 不会被 evict
+</pre>
+
+<p>反过来，要释放 inode 的条件是：</p>
+
+<pre style="font-size:0.8rem;border-left-color:#c62828;">
+inode 释放 = (i_nlink == 0)  且  (i_count == 0)
+              ↑ 磁盘上没有目录项指向它    ↑ 内存中没有 dentry/file 引用它
+</pre>
+
+<div class="figure">
+<svg viewBox="0 0 640 120" width="640" height="120" style="max-width:100%;height:auto;">
+  <!-- dentry -->
+  <rect x="20" y="35" width="140" height="36" rx="6" fill="#fce8e6" stroke="#c62828" stroke-width="1.5"/>
+  <text x="90" y="57" text-anchor="middle" font-size="11" font-weight="500">dentry</text>
+  <text x="90" y="69" text-anchor="middle" font-size="9" fill="#c62828">d_name="doc.txt"</text>
+
+  <!-- 锁 -->
+  <line x1="160" y1="53" x2="200" y2="53" stroke="#6b6760" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="180" y="46" text-anchor="middle" font-size="9" fill="#e65100">d_add()</text>
+  <text x="180" y="70" text-anchor="middle" font-size="8" fill="#e65100">i_count++</text>
+
+  <!-- inode -->
+  <rect x="200" y="20" width="200" height="66" rx="6" fill="#e3f2e0" stroke="#337733" stroke-width="1.5"/>
+  <text x="300" y="42" text-anchor="middle" font-size="11" font-weight="500">inode #1065432</text>
+  <text x="300" y="58" text-anchor="middle" font-size="10">i_count = 1</text>
+  <text x="300" y="74" text-anchor="middle" font-size="10">i_nlink = 1</text>
+
+  <!-- 释放条件 -->
+  <line x1="400" y1="53" x2="440" y2="53" stroke="#6b6760" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="440" y="20" width="180" height="66" rx="6" fill="#fce8e6" stroke="#c62828" stroke-width="1.2"/>
+  <text x="530" y="42" text-anchor="middle" font-size="11" font-weight="500">释放条件</text>
+  <text x="530" y="58" text-anchor="middle" font-size="10">i_count == 0（内存没人用）</text>
+  <text x="530" y="74" text-anchor="middle" font-size="10">且 i_nlink == 0（磁盘没人要）</text>
+
+  <defs>
+    <marker id="arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6" fill="#6b6760"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>dentry 通过 i_count 钉住 inode。两个条件同时满足才释放。</figcaption>
+</div>
+
+<h3>2.5 删除场景推演：理解 i_nlink 和 i_count</h3>
+
+<p>把之前课堂对话中的场景整理成一条时间线：</p>
+
+<div class="timeline">
+
+<div class="timeline-item">
+  <span class="tag tag-green">初始</span>
+  <code>/tmp/test.txt → inode #42</code>，i_nlink=1，i_count=0（尚未被任何人打开）
+</div>
+
+<div class="timeline-item">
+  <span class="tag tag-blue">open()</span>
+  lookup 创建 dentry → d_add() → <code>i_count = 1</code>（dentry 钉住了 inode）
+</div>
+
+<div class="timeline-item">
+  <span class="tag tag-orange">ln /tmp/hard.txt</span>
+  第二个 dentry 创建 → d_add() → <code>i_nlink = 2</code>，<code>i_count = 2</code>
+</div>
+
+<div class="timeline-item">
+  <span class="tag tag-red">rm /tmp/test.txt</span>
+  vfs_unlink() → ext4_unlink()（删除目录项）→ <code>i_nlink = 1</code><br>
+  d_delete() → 从哈希表摘除 dentry → iput() → <code>i_count = 1</code><br>
+  <strong>👉 inode 还在！</strong> 因为 hard.txt 的 dentry 还引用着它
+</div>
+
+<div class="timeline-item">
+  <span class="tag tag-red">rm /tmp/hard.txt</span>
+  vfs_unlink() → <code>i_nlink = 0</code><br>
+  d_delete() → iput() → <code>i_count = 0</code><br>
+  <strong>👉 inode 释放！</strong> 数据块标记为空闲
+</div>
+
+</div>
+
+<p>这就是"<strong>文件删了但空间没释放</strong>"的根本原因：被删的文件如果有进程打开了（持有 fd），<code>i_nlink = 0</code> 但 <code>i_count > 0</code>，inode 和数据块都不会被回收。重启后所有 fd 释放了，空间才回收。</p>
+
+<h3>2.6 dcache 的内存回收机制</h3>
+
+<p>dcache 不是无限增长的。内核通过几个机制控制它的内存占用：</p>
+
+<table>
+  <tr><th>机制</th><th>触发条件</th><th>行为</th></tr>
+  <tr>
+    <td><strong>LRU 链表回收</strong></td>
+    <td>系统内存低于 watermark</td>
+    <td>从 dentry 的 LRU 链表尾部开始回收，优先回收：
+      <ul style="margin:0.2em 0 0;font-size:0.85rem;">
+        <li>负 dentry（d_inode == NULL）</li>
+        <li>未被打开的 dentry（i_count == 0 但 dcache 还保留）</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td><strong>shrink_slab</strong></td>
+    <td>内核内存压力到达 <code>/proc/sys/vm/</code> 阈值</td>
+    <td>遍历所有 slab 缓存（包括 dentry、inode），缩水到目标值</td>
+  </tr>
+  <tr>
+    <td><strong>dentry_unhash / d_prune</strong></td>
+    <td>文件被删除</td>
+    <td>从 dcache 哈希表摘除，断开与 inode 的连接</td>
+  </tr>
+</table>
+
+<p>你可以通过以下命令观察 dcache 的使用状况：</p>
+
+<pre style="font-size:0.8rem;">
+# 查看 dentry 状态：nr_dentry / nr_unused / age_limit / want_pages
+cat /proc/sys/fs/dentry-state
+# 输出示例：47052  44532  45      0       0       0
+# 第1列：当前 dentry 总数
+# 第2列：未使用的 dentry 数（d_count==0 但还在 dcache 中备用）
+# 第3列：回收年龄阈值（秒）
+
+# 查看 slab 分配器中的 dentry 和 inode 缓存
+grep -E "(dentry|inode)" /proc/slabinfo
+</pre>
+
+<h2>3. 知识测验</h2>
+
+<div class="quiz" id="quiz1">
+  <div class="quiz-question">1️⃣ lookup_fast() 查找 dcache 时，用的是什么数据结构？</div>
+  <button class="quiz-option" onclick="cq(this,'wrong')">A. 红黑树（rbtree）</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">B. 双向链表</button>
+  <button class="quiz-option" onclick="cq(this,'correct')">C. 哈希表（hashtable）</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">D. B+ 树</button>
+  <div class="quiz-feedback" id="quiz1-fb">
+    <strong>正确答案：C</strong><br>
+    哈希键是 <code>(父 dentry 指针 + 名字 hash)</code>。这让人迷惑的一点是 dentry 的逻辑关系看起来像树，但查找入口是哈希表——O(1) 时间复杂度。
+  </div>
+</div>
+
+<div class="quiz" id="quiz2">
+  <div class="quiz-question">2️⃣ 执行 <code>rm test.log</code> 后，为什么可能空间没释放？请选出必要条件。</div>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">A. test.log 正在被另一个进程 tail -f</button>
+  <button class="quiz-option" onclick="cq2(this,'correct')">B. test.log 有硬链接</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">C. test.log 在 dcache 中还有负缓存</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">D. test.log 是符号链接</button>
+  <div class="quiz-feedback" id="quiz2-fb">
+    <strong>正确答案：A</strong><br>
+    选项 A 中，tail -f 持有 fd → file 对象 → inode 的引用 → i_count > 0，即使 i_nlink==0 也不会释放空间。<br>
+    选项 B 不对：有硬链接时 i_nlink 不会变成 0，所以空间本来就不该释放——这不是"释放不了"的问题。<br>
+    选项 C：负缓存是"不存在"的记录，不影响已存在的文件。<br>
+    关键判断标准：要空间不释放，必须是 i_count > 0 且 i_nlink == 0 同时成立。只有 A 对。
+  </div>
+</div>
+
+<div class="quiz" id="quiz3">
+  <div class="quiz-question">3️⃣ 关于 dcache 的负缓存（negative dentry），下面哪项描述是正确的？</div>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">A. 负缓存保存在磁盘上，重启后仍可用</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">B. 负缓存不会被回收，除非系统关机</button>
+  <button class="quiz-option" onclick="cq3(this,'correct')">C. 负缓存用于加速"文件不存在"的判断，但可能被大量无效查询污染</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">D. 负缓存产生时会发生磁盘写入</button>
+  <div class="quiz-feedback" id="quiz3-fb">
+    <strong>正确答案：C</strong><br>
+    负缓存纯在内存（A×），LRU 会优先回收它们（B×），而且负缓存产生不需要磁盘 I/O（D×）。C 正确描述了它的优势（加速不存在判断）和代价（可能被攻击者利用来挤占 dcache）。
+  </div>
+</div>
+
+<h2>4. 小结与下一步</h2>
+
+<p>本课你学到了什么：</p>
+<ul>
+  <li>✅ <code>open()</code> 完整的九步旅程，从用户态到磁盘，每步标注了内核源码文件</li>
+  <li>✅ dcache 的内部结构——哈希表 + 链表拉链，不是树</li>
+  <li>✅ RCU 无锁读如何让 lookup_fast 成为真正的"零成本"操作</li>
+  <li>✅ 负缓存的设计与风险</li>
+  <li>✅ dentry 通过 i_count 钉住 inode 的正确性担保</li>
+  <li>✅ <code>i_nlink</code> vs <code>i_count</code> 的双引用计数模型</li>
+</ul>
+
+<p>接下来：</p>
+<ul>
+  <li><strong>第三课</strong>：<code>read()</code> 的完整旅程 + Page Cache 深度解析——数据是怎么从磁盘进到内存、再从内存到用户态缓冲区的？</li>
+  <li><strong>第四课</strong>：ext4 磁盘数据结构——块组、inode 表、extent 树、延迟分配</li>
+</ul>
+
+<blockquote>
+  <strong>📮 有疑问？对某个步骤还想再深挖？</strong> 直接问我！可以展开某个子步骤的源码实现，也可以沿着"open 了之后 read() 怎么走"继续画路径。<br><br>
+  <strong>📚 推荐资料</strong>：
+  <em>Linux Kernel Development</em> (Robert Love) 第 12–13 章；
+  <a href="https://lwn.net/Articles/57369/" target="_blank">LWN: Understanding the Linux kernel's filesystem layer</a>；
+  <a href="https://docs.kernel.org/filesystems/vfs.html" target="_blank">内核 VFS 官方文档</a>
+</blockquote>
+
+<script>
+function cq(btn, result) {
+  const p = btn.parentElement;
+  const fb = p.querySelector('.quiz-feedback');
+  p.querySelectorAll('.quiz-option').forEach(b => { b.classList.remove('selected','correct','wrong'); });
+  btn.classList.add('selected', result);
+  fb.classList.add('show');
+  fb.className = 'quiz-feedback show ' + result;
+}
+function cq2(btn, result) { cq(btn, result); }
+function cq3(btn, result) { cq(btn, result); }
+</script>
+
+</body>
+</html>

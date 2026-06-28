@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第六课：虚拟文件系统——没有磁盘的文件系统怎么工作？</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+<style>
+  .compare-grid {
+    display: flex; gap: 1rem; margin: 1.5em 0;
+  }
+  .compare-grid .col {
+    flex: 1;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .compare-grid .col h4 {
+    margin-top: 0;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.4rem;
+  }
+  @media (max-width: 640px) {
+    .compare-grid { flex-direction: column; }
+  }
+
+  .proc-tree {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.6;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    margin: 1em 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .gen-flow {
+    counter-reset: gstep;
+    margin: 1.5em 0;
+  }
+  .gen-flow .step {
+    counter-increment: gstep;
+    margin: 0.6em 0;
+    padding: 0.6rem 1rem 0.6rem 3rem;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    position: relative;
+    font-size: 0.92rem;
+  }
+  .gen-flow .step::before {
+    content: counter(gstep);
+    position: absolute;
+    left: 0.6rem; top: 0.6rem;
+    width: 1.6rem; height: 1.6rem;
+    background: var(--accent);
+    color: white;
+    font-weight: 500;
+    font-size: 0.8rem;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .kobj-path {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    margin: 0.5em 0;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
+
+<h1>🧠 第六课：虚拟文件系统——没有磁盘的文件系统怎么工作？</h1>
+
+<div class="lesson-meta">
+  <strong>主题</strong>：procfs、sysfs、tmpfs——以内存/数据结构为"存储介质"的文件系统<br>
+  <strong>前置知识</strong>：第一课（VFS 四对象）、第二课（dcache 与 lookup）、第三课（page cache）<br>
+  <strong>预估时间</strong>：35–45 分钟
+</div>
+
+<h2>前五课的前提——"有磁盘"</h2>
+
+<p>前五课我们从 VFS 一直走到 ext4 的磁盘布局和 Journal，所有内容都建立在一个前提上：<strong>文件系统的数据最终存放在磁盘上</strong>。</p>
+
+<p>但 Linux 里有一类文件系统<strong>根本没有磁盘</strong>：</p>
+
+<pre>
+$ ls -la /proc/self/status
+-r--r--r-- 1 root root 0 Jun 25 10:00 /proc/self/status
+
+$ cat /proc/self/status
+Name:   cat
+State:  R (running)
+Pid:    1234
+VmRSS:       1234 kB
+...
+
+$ stat -f /proc
+File: "/proc"
+    ID: 0        Namelen: 255     Type: proc
+Block size: 4096    Fundamental block size: 4096
+Blocks: Total: 0      Free: 0      Available: 0
+</pre>
+
+<p>🔍 注意看：<strong>Blocks: Total: 0</strong>——procfs 没有数据块的概念。它的大小在 stat 里总是 0，因为文件内容是"读的时候现生成的"。</p>
+
+<div class="insight">
+  <strong>💡 核心问题</strong>：没有磁盘，那它的 inode 从哪来？它的数据存在哪？lookup() 怎么做？page cache 还有意义吗？<br><br>
+  答案是：<strong>全部在内存中动态生成</strong>。虚拟文件系统是 VFS 虚函数表设计哲学的极致体现。
+</div>
+
+<h2>1. VFS 的"依赖倒置"——回顾第一课的核心洞见</h2>
+
+<p>第一课我们学到：VFS 定义了四个核心对象，每个对象都包含一个<strong>操作函数表</strong>，不同的文件系统各自实现这些函数：</p>
+
+<pre>
+VFS 对象              操作函数表
+─────────────────────────────────────
+超级块 → super_operations  → alloc_inode, destroy_inode, write_inode, ...
+inode   → inode_operations → lookup, create, mkdir, link, ...
+文件    → file_operations  → read_iter, write_iter, open, fsync, mmap, ...
+dentry  → dentry_operations → d_revalidate, d_delete, ...
+</pre>
+
+<p>这正是<strong>依赖倒置原则</strong>的体现：VFS 不依赖具体文件系统的实现，具体文件系统实现 VFS 定义的接口。ext4 调用 ext4 的磁盘 I/O 例程；procfs 调用内核数据结构的读取例程——对 VFS 来说，它们长一个样。</p>
+
+<div class="figure">
+<svg viewBox="0 0 640 100" width="640" height="100" style="max-width:100%;height:auto;">
+  <!-- 用户 -->
+  <rect x="20" y="10" width="100" height="36" rx="6" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.5"/>
+  <text x="70" y="32" text-anchor="middle" font-size="11" fill="#2e6b9e">用户态</text>
+  <text x="70" y="44" text-anchor="middle" font-size="9" fill="#2e6b9e">cat /proc/pid/status</text>
+
+  <!-- VFS 层 -->
+  <rect x="180" y="10" width="120" height="36" rx="6" fill="#fff9c4" stroke="#d4a017" stroke-width="1.5"/>
+  <text x="240" y="32" text-anchor="middle" font-size="11" fill="#d4a017">VFS 层</text>
+  <text x="240" y="44" text-anchor="middle" font-size="9" fill="#d4a017">vfs_read()</text>
+
+  <!-- 分叉 -->
+  <line x1="300" y1="28" x2="360" y2="28" stroke="#666" stroke-width="1.2"/>
+  <line x1="360" y1="10" x2="360" y2="46" stroke="#666" stroke-width="1.2"/>
+
+  <!-- ext4 -->
+  <rect x="370" y="6" width="100" height="36" rx="6" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="420" y="22" text-anchor="middle" font-size="10" fill="#337733">ext4</text>
+  <text x="420" y="34" text-anchor="middle" font-size="8" fill="#337733">读磁盘 inode 表</text>
+
+  <!-- proc -->
+  <rect x="370" y="42" width="100" height="36" rx="6" fill="#fce8e6" stroke="#c62828" stroke-width="1.2"/>
+  <text x="420" y="58" text-anchor="middle" font-size="10" fill="#c62828">procfs</text>
+  <text x="420" y="70" text-anchor="middle" font-size="8" fill="#c62828">读 task_struct</text>
+
+  <rect x="500" y="10" width="100" height="70" rx="6" fill="#f5f5f5" stroke="#6b6760" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="550" y="32" text-anchor="middle" font-size="10">tmpfs</text>
+  <text x="550" y="44" text-anchor="middle" font-size="8">swap-backed</text>
+  <text x="550" y="56" text-anchor="middle" font-size="8">page cache</text>
+  <text x="550" y="68" text-anchor="middle" font-size="8">...</text>
+
+  <line x1="360" y1="28" x2="370" y2="28" stroke="#666" stroke-width="1.2"/>
+  <line x1="360" y1="28" x2="370" y2="60" stroke="#666" stroke-width="1.2"/>
+</svg>
+<figcaption>VFS 层擦作函数表，分派到不同文件系统各自的实现。对 VFS 来说，ext4 和 procfs 只是不同的 f_op。</figcaption>
+</div>
+
+<h2>2. procfs——/proc 就是进程数据结构的"文件系统视图"</h2>
+
+<h3>2.1 核心哲学</h3>
+
+<p>procfs 不是一个"存储文件内容的文件系统"，它是一个<strong>内核数据结构的动态展示窗口</strong>。每次你读 /proc 下的文件，内核都在"现编"文件内容。</p>
+
+<pre>
+$ cat /proc/self/status  # 你每次读，内容都可能不同
+Name:   cat               # 当前运行的进程名
+Pid:    1234              # 进程 ID
+VmRSS:  1234 kB           # 实时 RSS → 内存管理子系统当前的数据
+
+# 对比：ext4 文件读出来每次都一样（除非被修改）
+$ cat /home/user/doc.txt  # 存什么读什么
+</pre>
+
+<h3>2.2 procfs 的目录树就是进程树</h3>
+
+<div class="proc-tree">
+/proc
+├── 1/                  ← 进程 #1 (init/systemd) 的目录
+│   ├── cmdline         ← 进程启动命令行
+│   ├── cwd → /         ← 进程当前工作目录（软链接）
+│   ├── fd/
+│   │   ├── 0 → /dev/pts/0  ← 标准输入
+│   │   ├── 1 → /dev/pts/0  ← 标准输出
+│   │   └── 2 → /dev/pts/0  ← 标准错误
+│   ├── maps            ← 进程内存映射（mmap 区域）
+│   ├── status          ← 进程状态（Name, State, Pid, VmRSS, ...）
+│   ├── stack           ← 内核栈回溯
+│   └── root/           ← 进程的根文件系统（chroot 后此目录可见）
+├── self/               ← 指向当前进程的软链接（/proc/self → /proc/1234）
+├── cpuinfo             ← CPU 信息（从 per-CPU 数据生成）
+├── meminfo             ← 内存使用情况（从内存管理子系统生成）
+├── version             ← 内核版本号
+└── uptime              ← 系统运行时间
+</div>
+
+<h3>2.3 procfs 的文件生成过程——以 /proc/self/status 为例</h3>
+
+<div class="gen-flow">
+
+<div class="step">
+  <strong>用户调用 read()</strong>
+  <p><code>read(fd, buf, 4096)</code> → <code>vfs_read()</code> → <code>file->f_op->read_iter()</code></p>
+</div>
+
+<div class="step">
+  <strong>procfs 的 read_iter</strong>
+  <p><code>proc_reg_read_iter()</code> → 查找这个文件对应的 <code>proc_ops</code>（proc 操作表）</p>
+</div>
+
+<div class="step">
+  <strong>调用 proc 文件对应的 proc_ops->proc_read()</strong>
+  <p>每个 proc 文件注册了自己的"生成函数"。例如 <code>status</code> 文件的生成函数是 <code>proc_pid_status()</code>：</p>
+</div>
+
+<div class="step">
+  <strong>proc_pid_status() 中发生了什么</strong>
+  <pre style="font-size:0.78rem;">
+// fs/proc/array.c — 简化的伪代码
+int proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
+                    struct pid *pid, struct task_struct *task)
+{
+    // 从 task_struct 中读取字段，逐行格式化到 seq_file
+    task_name(m, task);        // → "Name:\tcat\n"
+    task_state(m, task);       // → "State:\tR (running)\n"
+    task_pid(m, task);         // → "Pid:\t1234\n"
+    task_sig(m, task);         // → 信号相关信息
+    task_mem(m, task);         // → "VmRSS:\t1234 kB\n"  ← 读 mm_struct
+    // ...
+    return 0;
+}
+</pre>
+</div>
+
+<div class="step">
+  <strong>数据组装到 seq_file 缓冲区</strong>
+  <p>seq_file 是内核的"顺序文件"辅助机制——procfs 将格式化文本写入 seq_file 的内核缓冲区，然后 <code>copy_to_user()</code> 到用户空间。整个过程<strong>不涉及 page cache</strong>（除了 seq_file 自己的内核缓冲区）。</p>
+</div>
+
+</div>
+
+<div class="insight">
+  <strong>💡 关键差异</strong>：ext4 的 read() 从<strong>磁盘</strong>读数据到 page cache，再从 page cache 拷贝到用户空间。procfs 的 read() 从<strong>task_struct、mm_struct 等内核数据结构</strong>中格式化出文本，直接拷贝到用户空间。<strong>procfs 不经过 page cache</strong>——因为内容每次读都可能不同，缓存没有意义。
+</div>
+
+<h3>2.4 seq_file——procfs 的"打印机"</h3>
+
+<p>seq_file 是内核专门为"顺序文件"（如 procfs、sysfs 中那些读一次就生成全部内容的文件）设计的辅助 API：</p>
+
+<pre>
+// seq_file 的工作方式：
+//
+// 用户 read() → seq_file 调用 show() 回调 → show() 用 seq_printf() 输出文本
+//
+// 内核开发者只需要实现一个 show() 函数：
+static int my_proc_show(struct seq_file *m, void *v)
+{
+    struct task_struct *task = current;
+    seq_printf(m, "Name:\t%s\n", task->comm);   // ← 格式化输出
+    seq_printf(m, "Pid:\t%d\n", task->pid);
+    return 0;
+}
+// seq_file 帮你处理了缓冲区管理、分页、seek 等所有细节
+</pre>
+
+<h3>2.5 procfs 的 inode 从哪来？</h3>
+
+<p>procfs 挂在 VFS 上，所以它必须有 inode。这些 inode 是<strong>在内存中动态创建</strong>的：</p>
+
+<pre>
+// 伪代码：procfs 挂载时创建根 inode
+struct inode *proc_root_inode = new_inode(proc_sb);  // 分配内存中的 inode
+proc_root_inode->i_mode = S_IFDIR | 0555;
+proc_root_inode->i_ino = PROC_ROOT_INO;  // inode #1（proc 命名空间内部）
+proc_root_inode->i_op = &proc_root_inode_operations;
+proc_root_inode->i_fop = &proc_root_file_operations;
+// → 不涉及任何磁盘 I/O
+
+// lookup() 时：创建新的子 inode
+struct dentry *proc_lookup(struct inode *dir, struct dentry *dentry)
+{
+    // 查找进程 PID 目录 → 如果进程存在，创建 inode
+    struct task_struct *task = find_task_by_pid(pid);
+    if (!task)
+        return ERR_PTR(-ENOENT);         // 进程不存在 → ENOENT
+
+    inode = proc_pid_make_inode(dir->i_sb, task);  // 分配 inode，填充
+    inode->i_fop = &proc_tgid_base_operations;
+    d_add(dentry, inode);                          // dentry 指向 inode
+    return NULL;                                   // 成功
+}
+</pre>
+
+<p>这些 inode 只存在于内存中——<code>kmalloc</code> 分配、用完 <code>kfree</code> 释放，不存在"写回磁盘"的概念。</p>
+
+<h2>3. sysfs——设备模型的文件系统视图</h2>
+
+<h3>3.1 从 kobject 到文件路径</h3>
+
+<p>sysfs 基于内核的<strong>设备模型（driver model）</strong>，核心概念是 <strong>kobject</strong>（kernel object）。每个 kobject 在 sysfs 中对应一个<strong>目录</strong>，kobject 的属性（attribute）对应目录下的<strong>文件</strong>：</p>
+
+<pre>
+/sys/
+├── devices/              ← 所有设备
+│   ├── pci0000:00/
+│   │   ├── 0000:00:02.0/ ← 一个 PCI 设备
+│   │   │   ├── vendor    ← 读这个文件 → 返回 "0x8086"（Intel）
+│   │   │   ├── device    ← 返回设备 ID
+│   │   │   └── driver → ../../../../bus/pci/drivers/i915/
+│   │   └── ...
+│   └── ...
+├── bus/                  ← 所有总线类型
+│   ├── pci/
+│   ├── usb/
+│   └── ...
+├── class/                ← 设备分类（按功能）
+│   ├── net/              ← 网络设备
+│   │   └── eth0/
+│   ├── input/            ← 输入设备
+│   └── ...
+├── block/                ← 块设备
+│   ├── sda/
+│   └── ...
+└── kernel/               ← 内核参数
+    ├── mm/
+    ├── uevent_helper
+    └── ...
+</pre>
+
+<h3>3.2 设备驱动注册与 sysfs 文件自动生成</h3>
+
+<pre>
+// 驱动注册 → 自动创建 sysfs 目录和文件
+// 以 PCI 设备为例：
+
+pci_register_driver(&my_driver);
+  → driver_register()
+    → kobject_add()           ← 在 /sys/bus/pci/drivers/my_driver/ 建目录
+    → 如果发现设备:
+      → device_add()
+        → kobject_add()       ← 在 /sys/devices/pci0000:00/0000:00:xx.x/ 建目录
+        → device_create_file() ← 在设备目录下创建属性文件
+
+// 属性文件 = 一组 show()/store() 回调
+static struct device_attribute dev_attr_my_value = {
+    .attr = { .name = "my_value", .mode = 0644 },
+    .show = my_value_show,   // 读文件时调用
+    .store = my_value_store, // 写文件时调用
+};
+
+// cat /sys/devices/.../my_value → 内核调用 my_value_show()
+static ssize_t my_value_show(struct device *dev,
+                             struct device_attribute *attr,
+                             char *buf)
+{
+    struct my_dev *my = dev_get_drvdata(dev);
+    return sprintf(buf, "%d\n", my->value);  // 从驱动数据结构读取
+}
+
+// echo 42 > /sys/devices/.../my_value → 内核调用 my_value_store()
+static ssize_t my_value_store(struct device *dev,
+                              struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+    struct my_dev *my = dev_get_drvdata(dev);
+    my->value = simple_strtol(buf, NULL, 10);  // 写入驱动数据结构
+    return count;
+}
+</pre>
+
+<h3>3.3 从 /sys/class/net/eth0/statistics/tx_bytes 看链路</h3>
+
+<p>这个路径追踪了发送字节数——网络驱动实时更新：</p>
+
+<pre>
+/sys/class/net/eth0/statistics/tx_bytes  →  read()
+  → sysfs_kf_read()
+    → dev_attr_show() → ethtool 回调
+      → 从 net_device->stats.tx_bytes 读取
+      → 返回 "12345678\n"
+</pre>
+
+<p>每次读都是<strong>实时值</strong>，因为这个值在内核中由网络驱动持续更新。sysfs 文件没有 page cache——读就是读，直接穿透到内核数据。</p>
+
+<h2>4. tmpfs——基于内存的"文件系统"</h2>
+
+<p>tmpfs 是一个特殊的存在——它<strong>有 page cache，有 inode，有 dentry，但没有磁盘</strong>。它的"存储"是 swap 空间（虚拟内存）。</p>
+
+<h3>4.1 tmpfs 的三层架构</h3>
+
+<div class="figure">
+<svg viewBox="0 0 640 140" width="640" height="140" style="max-width:100%;height:auto;">
+
+  <!-- VFS -->
+  <rect x="20" y="10" width="140" height="30" rx="4" fill="#fff9c4" stroke="#d4a017" stroke-width="1.2"/>
+  <text x="90" y="30" text-anchor="middle" font-size="10">VFS 层（通用接口）</text>
+
+  <!-- tmpfs -->
+  <rect x="200" y="10" width="140" height="30" rx="4" fill="#fce8e6" stroke="#c62828" stroke-width="1.2"/>
+  <text x="270" y="30" text-anchor="middle" font-size="10">shmem (tmpfs 内核模块)</text>
+
+  <!-- Page Cache -->
+  <rect x="380" y="10" width="140" height="30" rx="4" fill="#e3f2e0" stroke="#337733" stroke-width="1.2"/>
+  <text x="450" y="30" text-anchor="middle" font-size="10">Page Cache (address_space)</text>
+
+  <!-- 箭头 -->
+  <line x1="160" y1="25" x2="200" y2="25" stroke="#666" stroke-width="1"/>
+  <line x1="340" y1="25" x2="380" y2="25" stroke="#666" stroke-width="1"/>
+
+  <!-- Swap -->
+  <rect x="380" y="70" width="140" height="40" rx="4" fill="#f0efe9" stroke="#6b6760" stroke-width="1.2" stroke-dasharray="3,2"/>
+  <text x="450" y="90" text-anchor="middle" font-size="10">Swap 分区 / 文件</text>
+  <text x="450" y="103" text-anchor="middle" font-size="8" fill="#999">（可选后备存储）</text>
+
+  <line x1="450" y1="40" x2="450" y2="70" stroke="#6b6760" stroke-width="0.8" stroke-dasharray="3,2"/>
+  <text x="460" y="56" font-size="8" fill="#999">换出时使用</text>
+
+  <!-- RAM -->
+  <rect x="40" y="70" width="180" height="40" rx="4" fill="#e1eaf3" stroke="#2e6b9e" stroke-width="1.2"/>
+  <text x="130" y="90" text-anchor="middle" font-size="10">物理内存 (RAM)</text>
+  <text x="130" y="103" text-anchor="middle" font-size="8" fill="#2e6b9e">page cache 占据的页框</text>
+
+  <path d="M 130 40 L 130 70" fill="none" stroke="#2e6b9e" stroke-width="0.8" stroke-dasharray="3,2"/>
+  <text x="115" y="56" font-size="8" fill="#2e6b9e">数据驻留</text>
+
+</svg>
+<figcaption>tmpfs 的数据在 page cache 中。有内存压力时，脏页可以被换出到 swap 分区。</figcaption>
+</div>
+
+<h3>4.2 磁盘文件系统 vs tmpfs vs procfs —— 数据流对比</h3>
+
+<div class="compare-grid">
+  <div class="col">
+    <h4 style="color:#337733;">ext4</h4>
+    <p style="font-size:0.85rem;">
+      数据在<strong>磁盘</strong>上。<br><br>
+      read() → 磁盘 → page cache → 用户<br>
+      write() → 用户 → page cache → 磁盘
+    </p>
+  </div>
+  <div class="col">
+    <h4 style="color:#2e6b9e;">tmpfs</h4>
+    <p style="font-size:0.85rem;">
+      数据在<strong>page cache</strong>中。<br><br>
+      read() → page cache → 用户<br>
+      write() → 用户 → page cache<br>
+      (有内存压力时 → swap)
+    </p>
+  </div>
+  <div class="col">
+    <h4 style="color:#c62828;">procfs</h4>
+    <p style="font-size:0.85rem;">
+      数据在<strong>内核数据结构</strong>中。<br><br>
+      read() → task_struct → 格式化 → 用户<br>
+      没有 page cache，没有磁盘，<br>
+      内容是"现编"的
+    </p>
+  </div>
+</div>
+
+<h3>4.3 tmpfs 的"千万要记住"——写 tmpfs 不等于写内存安全</h3>
+
+<div class="insight">
+  <strong>⚠️ 常见误区</strong>：很多人以为 "tmpfs 在内存中，重启就没了，但运行时是安全的"。<br><br>
+  问题是：如果系统<strong>内存不足（OOM）</strong>，tmpfs 的数据可能被换出到 swap——而 swap 分区在重启后是垃圾数据。所以 tmpfs <strong>既不持久也不安全</strong>——它只是"一般情况下在内存中"。<br><br>
+  另外，tmpfs 上的文件可以通过 fsync() 刷脏页到 swap，但这种"持久化"在重启后无效。
+</div>
+
+<h2>5. 全景对比：四种文件系统</h2>
+
+<table>
+  <tr><th>维度</th><th>ext4</th><th>tmpfs</th><th>procfs</th><th>sysfs</th></tr>
+  <tr>
+    <td><strong>存储介质</strong></td>
+    <td>磁盘（旋转或 SSD）</td>
+    <td>RAM + swap</td>
+    <td>内核数据结构</td>
+    <td>内核数据结构</td>
+  </tr>
+  <tr>
+    <td><strong>inode 来源</strong></td>
+    <td>磁盘 inode 表</td>
+    <td>内存分配（shmem_get_inode）</td>
+    <td>内存分配（new_inode）</td>
+    <td>内存分配</td>
+  </tr>
+  <tr>
+    <td><strong>数据持久性</strong></td>
+    <td>✅ 持续存在</td>
+    <td>❌ 重启即失</td>
+    <td>❌ 动态生成</td>
+    <td>❌ 动态生成</td>
+  </tr>
+  <tr>
+    <td><strong>使用 page cache</strong></td>
+    <td>✅ 是</td>
+    <td>✅ 是（数据本身就在 page cache 中）</td>
+    <td>❌ 否（内容每次不同）</td>
+    <td>❌ 否（属性始终实时）</td>
+  </tr>
+  <tr>
+    <td><strong>fsync 行为</strong></td>
+    <td>刷脏页 + 日志提交 + FLUSH CACHE</td>
+    <td>刷脏页到 swap</td>
+    <td>几乎空操作</td>
+    <td>空操作（无 f_op->fsync）</td>
+  </tr>
+  <tr>
+    <td><strong>文件大小</strong></td>
+    <td>有限制（磁盘容量决定）</td>
+    <td>有限制（内存大小决定）</td>
+    <td>总是 0（stat 显示为 0）</td>
+    <td>每个属性文件返回 PAGE_SIZE</td>
+  </tr>
+  <tr>
+    <td><strong>典型用途</strong></td>
+    <td>用户数据存储</td>
+    <td>/tmp, /dev/shm</td>
+    <td>进程信息、内核参数</td>
+    <td>设备发现、驱动配置</td>
+  </tr>
+</table>
+
+<h2>6. 思考题</h2>
+
+<div class="quiz" id="quiz1">
+  <div class="quiz-question">1️⃣ procfs 的文件内容在什么时候生成？</div>
+  <button class="quiz-option" onclick="cq(this,'wrong')">A. 文件创建时</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">B. 挂载时</button>
+  <button class="quiz-option" onclick="cq(this,'correct')">C. 每次 read() 调用时</button>
+  <button class="quiz-option" onclick="cq(this,'wrong')">D. 进程启动时</button>
+  <div class="quiz-feedback" id="quiz1-fb">
+    <strong>正确答案：C</strong><br>
+    procfs 的文件内容不是在创建或挂载时固定的。每次 read() 时，内核调用对应的 proc_ops->proc_read() 回调，从内核数据结构中实时读取/格式化数据。这就是为什么两次读 /proc/meminfo 可能得到不同结果。
+  </div>
+</div>
+
+<div class="quiz" id="quiz2">
+  <div class="quiz-question">2️⃣ procfs 为什么不使用 page cache？</div>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">A. 没有足够的磁盘空间</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">B. 内核开发者忘了实现</button>
+  <button class="quiz-option" onclick="cq2(this,'correct')">C. 内容是动态的，每次读都可能不同，缓存没有意义</button>
+  <button class="quiz-option" onclick="cq2(this,'wrong')">D. 性能太低</button>
+  <div class="quiz-feedback" id="quiz2-fb">
+    <strong>正确答案：C</strong><br>
+    procfs 读取的是实时内核数据（进程状态、内存使用、CPU 信息等），这些数据随时在变化。如果使用 page cache，读到的可能是"过期"的数据——违背了 procfs"实时展示"的设计目标。seq_file 机制提供的"按需生成+直接输出"模式更合适。
+  </div>
+</div>
+
+<div class="quiz" id="quiz3">
+  <div class="quiz-question">3️⃣ tmpfs 的数据在系统重启后还在吗？</div>
+  <button class="quiz-option" onclick="cq3(this,'correct')">A. 不在，tmpfs 完全在内存中，重启后清空</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">B. 在，因为 tmpfs 的数据会写回硬盘</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">C. 在，但需要执行 sync</button>
+  <button class="quiz-option" onclick="cq3(this,'wrong')">D. 在，因为 tmpfs 有专门的持久化机制</button>
+  <div class="quiz-feedback" id="quiz3-fb">
+    <strong>正确答案：A</strong><br>
+    tmpfs 的数据在 page cache 中，底层没有持久存储。即使被换出到 swap（内存压力时），swap 分区在重启后是垃圾数据。所以 tmpfs 是"临时"的——系统运行期间可用，重启后一切消失。这也是为什么它叫 tmpfs（temporary filesystem）。
+  </div>
+</div>
+
+<div class="quiz" id="quiz4">
+  <div class="quiz-question">4️⃣ 你有一个 ext4 文件和一个 procfs 文件，分别 open 后在两个文件上同时 read()。VFS 如何区分它们？</div>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">A. 通过文件扩展名判断</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">B. 通过文件的 inode 号范围判断</button>
+  <button class="quiz-option" onclick="cq4(this,'correct')">C. 通过 file->f_op（操作函数表）判断——两个文件的函数表不同</button>
+  <button class="quiz-option" onclick="cq4(this,'wrong')">D. 通过文件的父目录判断</button>
+  <div class="quiz-feedback" id="quiz4-fb">
+    <strong>正确答案：C</strong><br>
+    VFS 不关心"什么类型的文件系统"。每个 file 对象都持有自己的 f_op 指针——ext4 文件的 f_op 指向 ext4_file_operations（含 ext4_file_read_iter），procfs 文件的 f_op 指向 proc_reg_file_operations（含 proc_reg_read_iter）。VFS 调用 file->f_op->read_iter() 时，自然走到了各自不同的实现。
+  </div>
+</div>
+
+<div class="quiz" id="quiz5">
+  <div class="quiz-question">5️⃣ sysfs 中 "cat /sys/class/net/eth0/statistics/tx_bytes" 读到的是什么时候的数据？</div>
+  <button class="quiz-option" onclick="cq5(this,'correct')">A. 当前实时的发送字节数</button>
+  <button class="quiz-option" onclick="cq5(this,'wrong')">B. 上一次定时更新缓存的值</button>
+  <button class="quiz-option" onclick="cq5(this,'wrong')">C. 网卡驱动加载时的初始值</button>
+  <button class="quiz-option" onclick="cq5(this,'wrong')">D. 内核编译时的默认值</button>
+  <div class="quiz-feedback" id="quiz5-fb">
+    <strong>正确答案：A</strong><br>
+    sysfs 属性文件的 show() 回调直接从设备驱动数据结构中读取实时值。对于网络统计，驱动会在每次数据包发送/接收时更新 net_device->stats 中的计数器。cat 该文件时，show() 回调只做一个 sprintf() 将当前计数器的值格式化成字符串返回——所以永远是最新的。
+  </div>
+</div>
+
+<h2>7. 小结与下一步</h2>
+
+<p>本课你学到了：</p>
+<ul>
+  <li>✅ <strong>虚拟文件系统的本质</strong>——VFS 虚函数表的极致体现，没有磁盘也能是"文件系统"</li>
+  <li>✅ <strong>procfs</strong>——进程数据结构的动态展示窗口，内容在 read() 时"现编"</li>
+  <li>✅ <strong>seq_file</strong>——procfs 和 sysfs 的"打印机"辅助机制</li>
+  <li>✅ <strong>sysfs</strong>——设备模型（kobject）的文件系统视图，属性文件读写直接操作驱动数据</li>
+  <li>✅ <strong>tmpfs</strong>——基于 page cache + swap 的临时文件系统</li>
+  <li>✅ <strong>四种文件系统的完整对比</strong>——存储介质、inode 来源、page cache 使用、fsync 行为</li>
+</ul>
+
+<p>前六课已经覆盖了 VFS 四对象、open/read 路径、dcache、page cache、ext4 磁盘布局、Journal/fsync、虚拟文件系统——你已经有了一个比较完整的 Linux 文件系统知识体系。</p>
+
+<p>接下来可以有两个方向：</p>
+<ul>
+  <li><strong>方向 B：I/O 模块</strong>——从 BIO 到块层、多队列（blk-mq）、I/O 调度器、磁盘驱动，补齐"第 5 步"的细节</li>
+  <li><strong>深入方向</strong>——某个具体系统的实现细节，比如 FUSE（用户态文件系统）、overlayfs（容器镜像分层）、epoll/io_uring 等</li>
+</ul>
+
+<blockquote>
+  <strong>📮 有疑问？</strong> 关于虚拟文件系统还有什么不清楚的随时来问！比如 overlayfs 怎么实现容器镜像分层、FUSE 怎么让用户态实现文件系统、devpts（/dev/pts）怎么管理伪终端等。<br><br>
+  <strong>📚 推荐资料</strong>：<em>Linux Kernel Development</em> (Robert Love) 第 13-14 章——深入讲解 VFS 和虚拟文件系统的实现细节。<code>man 5 proc</code> 和 <code>ls -la /sys/</code> 在你自己系统上探索。
+</blockquote>
+
+<script>
+function cq(btn,result){var p=btn.parentElement,fb=p.querySelector('.quiz-feedback');p.querySelectorAll('.quiz-option').forEach(function(b){return b.classList.remove('selected','correct','wrong');});btn.classList.add('selected',result);fb.classList.add('show');fb.className='quiz-feedback show '+result;}
+function cq2(btn,result){cq(btn,result);}
+function cq3(btn,result){cq(btn,result);}
+function cq4(btn,result){cq(btn,result);}
+function cq5(btn,result){cq(btn,result);}
+</script>
+
+</body>
+</html>
